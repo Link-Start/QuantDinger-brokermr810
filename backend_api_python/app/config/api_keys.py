@@ -12,12 +12,43 @@ class MetaAPIKeys(type):
         from app.utils.config_loader import load_addon_config
         val = load_addon_config().get('finnhub', {}).get('api_key')
         return val if val else os.getenv('FINNHUB_API_KEY', '')
+
+    @property
+    def COINGLASS_API_KEY(cls):
+        from app.utils.config_loader import load_addon_config
+        val = load_addon_config().get('coinglass', {}).get('api_key')
+        return val if val else os.getenv('COINGLASS_API_KEY', '')
+
+    @property
+    def CRYPTOQUANT_API_KEY(cls):
+        from app.utils.config_loader import load_addon_config
+        val = load_addon_config().get('cryptoquant', {}).get('api_key')
+        return val if val else os.getenv('CRYPTOQUANT_API_KEY', '')
     
     @property
     def TIINGO_API_KEY(cls):
         from app.utils.config_loader import load_addon_config
         val = load_addon_config().get('tiingo', {}).get('api_key')
         return val if val else os.getenv('TIINGO_API_KEY', '')
+
+    @property
+    def TWELVE_DATA_API_KEY(cls):
+        env_val = os.getenv('TWELVE_DATA_API_KEY', '').strip()
+        if env_val:
+            return env_val
+        from app.utils.config_loader import load_addon_config
+        val = load_addon_config().get('twelve_data', {}).get('api_key')
+        return val if val else ''
+
+    @property
+    def ADANOS_API_KEY(cls):
+        """Adanos Market Sentiment API key (optional)."""
+        env_val = os.getenv('ADANOS_API_KEY', '').strip()
+        if env_val:
+            return env_val
+        from app.utils.config_loader import load_addon_config
+        val = load_addon_config().get('adanos', {}).get('api_key')
+        return val if val else ''
     
     @property
     def OPENROUTER_API_KEY(cls):
@@ -67,6 +98,66 @@ class MetaAPIKeys(type):
             return env_val
         from app.utils.config_loader import load_addon_config
         val = load_addon_config().get('grok', {}).get('api_key')
+        return val if val else ''
+
+    @property
+    def ATLASCLOUD_API_KEY(cls):
+        """AtlasCloud API key"""
+        env_val = os.getenv('ATLASCLOUD_API_KEY', '').strip()
+        if env_val:
+            return env_val
+        from app.utils.config_loader import load_addon_config
+        val = load_addon_config().get('atlascloud', {}).get('api_key')
+        return val if val else ''
+
+    @property
+    def CUSTOM_API_KEY(cls):
+        """Custom LLM API key (for OpenAI-compatible custom endpoints)"""
+        env_val = os.getenv('CUSTOM_API_KEY', '').strip()
+        if env_val:
+            return env_val
+        from app.utils.config_loader import load_addon_config
+        val = load_addon_config().get('custom', {}).get('api_key')
+        return val if val else ''
+
+    @property
+    def CUSTOM_API_URL(cls):
+        """Custom LLM API base URL (e.g., https://your-api.com/v1)"""
+        env_val = os.getenv('CUSTOM_API_URL', '').strip()
+        if env_val:
+            return env_val
+        from app.utils.config_loader import load_addon_config
+        val = load_addon_config().get('custom', {}).get('base_url')
+        return val if val else ''
+
+    @property
+    def CUSTOM_MODEL(cls):
+        """Custom LLM model name"""
+        env_val = os.getenv('CUSTOM_MODEL', '').strip()
+        if env_val:
+            return env_val
+        from app.utils.config_loader import load_addon_config
+        val = load_addon_config().get('custom', {}).get('model')
+        return val if val else ''
+
+    @property
+    def MINIMAX_API_KEY(cls):
+        """MiniMax API key"""
+        env_val = os.getenv('MINIMAX_API_KEY', '').strip()
+        if env_val:
+            return env_val
+        from app.utils.config_loader import load_addon_config
+        val = load_addon_config().get('minimax', {}).get('api_key')
+        return val if val else ''
+
+    @property
+    def LITELLM_API_KEY(cls):
+        """LiteLLM API key (optional, litellm reads provider env vars automatically)"""
+        env_val = os.getenv('LITELLM_API_KEY', '').strip()
+        if env_val:
+            return env_val
+        from app.utils.config_loader import load_addon_config
+        val = load_addon_config().get('litellm', {}).get('api_key')
         return val if val else ''
     
     @property

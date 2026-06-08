@@ -16,6 +16,7 @@ from typing import Any, Dict
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
 from app.utils.credential_crypto import decrypt_credential_blob
+from app.services.live_trading.capabilities import canonical_exchange_id, supported_crypto_exchange_ids
 
 logger = get_logger(__name__)
 
@@ -34,6 +35,38 @@ def _safe_json_loads(value: Any, default: Any) -> Any:
         return json.loads(s)
     except Exception:
         return default
+
+
+# Map exchange_id -> implied market_category, used as a safety net so we never
+# silently route stock/forex strategies through the crypto data source just
+# because `market_category` was missing from the row.
+#
+# Keep this list in sync with:
+#   - app/services/live_trading/factory.py::create_client
+#   - app/services/pending_order_worker.py::_execute_live_order validation
+#   - app/services/strategy.py validators (create / update / batch_create)
+_EXCHANGE_TO_MARKET: Dict[str, str] = {
+    "ibkr": "USStock",
+    "alpaca": "USStock",  # Alpaca primarily for US stocks; crypto is opt-in via market_category override
+    "mt5": "Forex",
+}
+_CRYPTO_EXCHANGES = supported_crypto_exchange_ids()
+
+
+def _infer_market_category_from_exchange(exchange_id: str) -> str:
+    """
+    Best-effort inference when market_category is missing on a strategy row.
+
+    Returns 'Crypto' as the legacy default only if exchange_id is empty or unknown.
+    """
+    eid = canonical_exchange_id(exchange_id)
+    if not eid:
+        return "Crypto"
+    if eid in _EXCHANGE_TO_MARKET:
+        return _EXCHANGE_TO_MARKET[eid]
+    if eid in _CRYPTO_EXCHANGES:
+        return "Crypto"
+    return "Crypto"
 
 
 def mask_secret(s: str, keep: int = 4) -> str:
@@ -62,7 +95,7 @@ def load_strategy_configs(strategy_id: int) -> Dict[str, Any]:
         cur = db.cursor()
         cur.execute(
             """
-            SELECT id, user_id, exchange_config, trading_config, market_type, leverage, execution_mode, market_category
+            SELECT id, user_id, symbol, exchange_config, trading_config, market_type, leverage, execution_mode, market_category
             FROM qd_strategies_trading
             WHERE id = %s
             """,
@@ -77,12 +110,34 @@ def load_strategy_configs(strategy_id: int) -> Dict[str, Any]:
     market_type = (row.get("market_type") or exchange_config.get("market_type") or "swap").strip()
     leverage = float(row.get("leverage") or trading_config.get("leverage") or exchange_config.get("leverage") or 1.0)
     execution_mode = (row.get("execution_mode") or "signal").strip().lower()
-    market_category = (row.get("market_category") or "Crypto").strip()
+
+    # market_category MUST come from the strategy row; if it's empty (legacy or
+    # corrupt rows), infer from exchange_id rather than silently defaulting to
+    # Crypto — that is what historically caused TSLA to be queried via CCXT.
+    raw_mc = (row.get("market_category") or "").strip()
+    if raw_mc:
+        market_category = raw_mc
+    else:
+        ex_id = ""
+        if isinstance(exchange_config, dict):
+            ex_id = str(exchange_config.get("exchange_id") or exchange_config.get("exchangeId") or "").strip().lower()
+        market_category = _infer_market_category_from_exchange(ex_id)
+        logger.warning(
+            "Strategy %s has empty market_category — inferred '%s' from exchange_id=%r. "
+            "Please re-save the strategy with an explicit market_category to silence this warning.",
+            strategy_id, market_category, ex_id,
+        )
+
     user_id = int(row.get("user_id") or 1)
+
+    row_symbol = str(row.get("symbol") or "").strip()
+    tc_symbol = str((trading_config or {}).get("symbol") or "").strip()
+    symbol = row_symbol or tc_symbol
 
     return {
         "strategy_id": int(strategy_id),
         "user_id": user_id,
+        "symbol": symbol,
         "exchange_config": exchange_config if isinstance(exchange_config, dict) else {},
         "trading_config": trading_config if isinstance(trading_config, dict) else {},
         "market_type": market_type,
@@ -145,5 +200,61 @@ def resolve_exchange_config(exchange_config: Dict[str, Any], user_id: int = 1) -
         merged[k] = v
 
     return merged
+
+
+def coalesce_exchange_config_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a single exchange_config dict from all common payload shapes.
+
+    Historical clients (and some UI flows) put ``exchange_id`` / ``credential_id``
+    on the request root or inside ``trading_config`` instead of ``exchange_config``.
+    ``TradingExecutor._live_crypto_kline_params`` already reads trading_config as
+    a fallback at runtime; create/update must do the same so live strategies
+    validate and persist the broker binding correctly.
+    """
+    if not isinstance(payload, dict):
+        return {}
+
+    raw_ex = payload.get("exchange_config")
+    ex_cfg: Dict[str, Any] = dict(raw_ex) if isinstance(raw_ex, dict) else {}
+
+    tc = payload.get("trading_config")
+    trading_config = tc if isinstance(tc, dict) else {}
+
+    from app.services.live_trading.factory import merge_root_exchange_config_overlay
+
+    ex_cfg = merge_root_exchange_config_overlay(root=payload, exchange_config=ex_cfg)
+
+    def _first_str(*candidates: Any) -> str:
+        for c in candidates:
+            if c is None:
+                continue
+            s = str(c).strip()
+            if s:
+                return s
+        return ""
+
+    if not _first_str(ex_cfg.get("exchange_id"), ex_cfg.get("exchangeId"), ex_cfg.get("exchange")):
+        hit = _first_str(
+            trading_config.get("exchange_id"),
+            trading_config.get("exchangeId"),
+            trading_config.get("exchange"),
+            payload.get("exchange_id"),
+            payload.get("exchangeId"),
+            payload.get("exchange"),
+        )
+        if hit:
+            ex_cfg["exchange_id"] = hit
+
+    if not _first_str(ex_cfg.get("credential_id"), ex_cfg.get("credentials_id")):
+        cred = _first_str(
+            trading_config.get("credential_id"),
+            trading_config.get("credentials_id"),
+            payload.get("credential_id"),
+            payload.get("credentials_id"),
+        )
+        if cred:
+            ex_cfg["credential_id"] = cred
+
+    return ex_cfg
 
 

@@ -4,9 +4,12 @@ User Management API Routes
 Provides endpoints for user CRUD operations, role management, etc.
 Only accessible by admin users.
 """
+import csv
 import json
+from io import StringIO
 import re
-from flask import Blueprint, request, jsonify, g
+from flask import Response, g, jsonify, request
+from app.openapi.blueprint import HumanBlueprint as Blueprint
 from app.services.user_service import get_user_service
 from app.utils.auth import login_required, admin_required
 from app.utils.db import get_db_connection
@@ -16,10 +19,37 @@ logger = get_logger(__name__)
 
 _PROFILE_TIMEZONE_RE = re.compile(r'^[A-Za-z0-9_/+\-.]+$')
 
-user_bp = Blueprint('user_manage', __name__)
+
+def _parse_positive_int(value) -> int:
+    """Parse query-string int; return 0 when missing/invalid."""
+    if value is None or value == '':
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
-@user_bp.route('/list', methods=['GET'])
+def _ensure_chart_templates_column():
+    """Add qd_users.chart_templates when upgrading existing databases."""
+    try:
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                """
+                ALTER TABLE qd_users
+                ADD COLUMN IF NOT EXISTS chart_templates TEXT DEFAULT ''
+                """
+            )
+            db.commit()
+            cur.close()
+    except Exception as e:
+        logger.warning(f"ensure chart_templates column skipped: {e}")
+
+user_blp = Blueprint('user_manage', __name__)
+
+
+@user_blp.route('/list', methods=['GET'])
 @login_required
 @admin_required
 def list_users():
@@ -29,15 +59,21 @@ def list_users():
     Query params:
         page: int (default 1)
         page_size: int (default 20, max 100)
-        search: str (optional, search by username/email/nickname)
+        search: str (optional, search by username/email/nickname/id)
+        user_id: int (optional, exact user id filter)
     """
     try:
         page = request.args.get('page', 1, type=int)
         page_size = request.args.get('page_size', 20, type=int)
         search = request.args.get('search', '', type=str)
+        user_id = _parse_positive_int(request.args.get('user_id'))
+        if user_id <= 0:
+            user_id = None
         page_size = min(100, max(1, page_size))
         
-        result = get_user_service().list_users(page=page, page_size=page_size, search=search)
+        result = get_user_service().list_users(
+            page=page, page_size=page_size, search=search, user_id=user_id,
+        )
         
         return jsonify({
             'code': 1,
@@ -49,7 +85,58 @@ def list_users():
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
-@user_bp.route('/detail', methods=['GET'])
+@user_blp.route('/export', methods=['GET'])
+@login_required
+@admin_required
+def export_users():
+    """Export all users as an Excel-friendly CSV file (admin only)."""
+    try:
+        search = request.args.get('search', '', type=str)
+        user_id = _parse_positive_int(request.args.get('user_id'))
+        if user_id <= 0:
+            user_id = None
+        users = get_user_service().list_all_users_for_export(search=search, user_id=user_id)
+
+        output = StringIO()
+        output.write('\ufeff')
+        writer = csv.writer(output)
+        writer.writerow([
+            'ID', 'Username', 'Email', 'Nickname', 'Role', 'Status',
+            'Credits', 'VIP Expires At', 'Timezone', 'Register IP',
+            'Last Login At', 'Created At', 'Updated At'
+        ])
+
+        for user in users:
+            writer.writerow([
+                user.get('id') or '',
+                user.get('username') or '',
+                user.get('email') or '',
+                user.get('nickname') or '',
+                user.get('role') or '',
+                user.get('status') or '',
+                user.get('credits') or 0,
+                user.get('vip_expires_at') or '',
+                user.get('timezone') or '',
+                user.get('register_ip') or '',
+                user.get('last_login_at') or '',
+                user.get('created_at') or '',
+                user.get('updated_at') or '',
+            ])
+
+        filename = 'quantdinger_users_export.csv'
+        return Response(
+            output.getvalue(),
+            mimetype='text/csv; charset=utf-8',
+            headers={
+                'Content-Disposition': f'attachment; filename="{filename}"'
+            }
+        )
+    except Exception as e:
+        logger.error(f"export_users failed: {e}", exc_info=True)
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@user_blp.route('/detail', methods=['GET'])
 @login_required
 @admin_required
 def get_user_detail():
@@ -73,7 +160,7 @@ def get_user_detail():
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
-@user_bp.route('/create', methods=['POST'])
+@user_blp.route('/create', methods=['POST'])
 @login_required
 @admin_required
 def create_user():
@@ -104,7 +191,7 @@ def create_user():
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
-@user_bp.route('/update', methods=['PUT'])
+@user_blp.route('/update', methods=['PUT'])
 @login_required
 @admin_required
 def update_user():
@@ -138,7 +225,7 @@ def update_user():
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
-@user_bp.route('/delete', methods=['DELETE'])
+@user_blp.route('/delete', methods=['DELETE'])
 @login_required
 @admin_required
 def delete_user():
@@ -163,7 +250,7 @@ def delete_user():
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
-@user_bp.route('/reset-password', methods=['POST'])
+@user_blp.route('/reset-password', methods=['POST'])
 @login_required
 @admin_required
 def reset_user_password():
@@ -198,7 +285,7 @@ def reset_user_password():
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
-@user_bp.route('/roles', methods=['GET'])
+@user_blp.route('/roles', methods=['GET'])
 @login_required
 @admin_required
 def get_roles():
@@ -222,7 +309,7 @@ def get_roles():
 
 # ==================== Billing Management (Admin) ====================
 
-@user_bp.route('/set-credits', methods=['POST'])
+@user_blp.route('/set-credits', methods=['POST'])
 @login_required
 @admin_required
 def set_user_credits():
@@ -260,7 +347,7 @@ def set_user_credits():
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
-@user_bp.route('/set-vip', methods=['POST'])
+@user_blp.route('/set-vip', methods=['POST'])
 @login_required
 @admin_required
 def set_user_vip():
@@ -306,9 +393,10 @@ def set_user_vip():
         
         if success:
             return jsonify({
-                'code': 1, 
-                'msg': 'VIP status updated successfully', 
-                'data': {'vip_expires_at': expires_at.isoformat() if expires_at else None}
+                'code': 1,
+                'msg': 'VIP status updated successfully',
+                # Let SafeJSONProvider normalize datetimes to UTC ISO (with Z).
+                'data': {'vip_expires_at': expires_at if expires_at else None}
             })
         else:
             return jsonify({'code': 0, 'msg': result, 'data': None}), 400
@@ -317,7 +405,7 @@ def set_user_vip():
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
-@user_bp.route('/credits-log', methods=['GET'])
+@user_blp.route('/credits-log', methods=['GET'])
 @login_required
 @admin_required
 def get_user_credits_log():
@@ -350,7 +438,28 @@ def get_user_credits_log():
 
 # Self-service endpoints (accessible by any logged-in user)
 
-@user_bp.route('/profile', methods=['GET'])
+@user_blp.route('/login-logs', methods=['GET'])
+@login_required
+def get_login_logs():
+    """Paginated account login history (password / email code / OAuth)."""
+    try:
+        user_id = getattr(g, 'user_id', None)
+        if not user_id:
+            return jsonify({'code': 0, 'msg': 'Not authenticated', 'data': None}), 401
+
+        page = int(request.args.get('page') or 1)
+        page_size = int(request.args.get('page_size') or 20)
+
+        from app.services.login_notify import list_login_logs
+
+        data = list_login_logs(int(user_id), page=page, page_size=page_size)
+        return jsonify({'code': 1, 'msg': 'success', 'data': data})
+    except Exception as e:
+        logger.error(f"get_login_logs failed: {e}")
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@user_blp.route('/profile', methods=['GET'])
 @login_required
 def get_profile():
     """Get current user's profile with billing info and notification settings"""
@@ -405,7 +514,7 @@ def get_profile():
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
-@user_bp.route('/profile/update', methods=['PUT'])
+@user_blp.route('/profile/update', methods=['PUT'])
 @login_required
 def update_profile():
     """
@@ -457,7 +566,7 @@ def update_profile():
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
-@user_bp.route('/my-credits-log', methods=['GET'])
+@user_blp.route('/my-credits-log', methods=['GET'])
 @login_required
 def get_my_credits_log():
     """
@@ -486,7 +595,7 @@ def get_my_credits_log():
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
-@user_bp.route('/my-referrals', methods=['GET'])
+@user_blp.route('/my-referrals', methods=['GET'])
 @login_required
 def get_my_referrals():
     """
@@ -547,7 +656,8 @@ def get_my_referrals():
                     'username': row['username'],
                     'nickname': row['nickname'],
                     'avatar': row['avatar'],
-                    'created_at': row['created_at'].isoformat() if row['created_at'] else None
+                    # SafeJSONProvider serializes datetimes as UTC ISO.
+                    'created_at': row['created_at']
                 })
         
         return jsonify({
@@ -568,7 +678,7 @@ def get_my_referrals():
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
-@user_bp.route('/notification-settings', methods=['GET'])
+@user_blp.route('/notification-settings', methods=['GET'])
 @login_required
 def get_notification_settings():
     """
@@ -624,7 +734,7 @@ def get_notification_settings():
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
-@user_bp.route('/notification-settings', methods=['PUT'])
+@user_blp.route('/notification-settings', methods=['PUT'])
 @login_required
 def update_notification_settings():
     """
@@ -657,6 +767,12 @@ def update_notification_settings():
             default_channels = ['browser']
         
         # Build settings object
+        #
+        # webhook_signing_secret is optional and only meaningful for
+        # specific dialects (Feishu in-body sign / DingTalk URL sign).
+        # Generic self-hosted webhooks can use it for HMAC header
+        # signing — see signal_notifier._notify_webhook for the full
+        # semantics.
         settings = {
             'default_channels': default_channels,
             'telegram_bot_token': str(data.get('telegram_bot_token') or '').strip(),
@@ -665,6 +781,7 @@ def update_notification_settings():
             'discord_webhook': str(data.get('discord_webhook') or '').strip(),
             'webhook_url': str(data.get('webhook_url') or '').strip(),
             'webhook_token': str(data.get('webhook_token') or '').strip(),
+            'webhook_signing_secret': str(data.get('webhook_signing_secret') or '').strip(),
             'phone': str(data.get('phone') or '').strip(),
         }
         
@@ -692,7 +809,192 @@ def update_notification_settings():
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
-@user_bp.route('/notification-settings/test', methods=['POST'])
+@user_blp.route('/chart-templates', methods=['GET'])
+@login_required
+def get_chart_templates():
+    """Get current user's indicator chart templates."""
+    try:
+        user_id = getattr(g, 'user_id', None)
+        if not user_id:
+            return jsonify({'code': 0, 'msg': 'Not authenticated', 'data': None}), 401
+
+        _ensure_chart_templates_column()
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute("SELECT chart_templates FROM qd_users WHERE id = ?", (user_id,))
+            row = cur.fetchone()
+            cur.close()
+
+        raw = (row.get('chart_templates') if row else '') or ''
+        templates = []
+        if raw:
+            try:
+                templates = json.loads(raw)
+            except Exception:
+                templates = []
+        if not isinstance(templates, list):
+            templates = []
+
+        templates = sorted(
+            [tpl for tpl in templates if isinstance(tpl, dict)],
+            key=lambda x: str(x.get('updated_at') or ''),
+            reverse=True
+        )
+        return jsonify({'code': 1, 'msg': 'success', 'data': templates})
+    except Exception as e:
+        logger.error(f"get_chart_templates failed: {e}")
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@user_blp.route('/chart-templates', methods=['POST'])
+@login_required
+def save_chart_template():
+    """Create or update a user's indicator chart template."""
+    try:
+        user_id = getattr(g, 'user_id', None)
+        if not user_id:
+            return jsonify({'code': 0, 'msg': 'Not authenticated', 'data': None}), 401
+
+        data = request.get_json() or {}
+        name = str(data.get('name') or '').strip()
+        template_id = str(data.get('template_id') or '').strip()
+        indicators = data.get('indicators') or []
+
+        if not name:
+            return jsonify({'code': 0, 'msg': 'Template name is required', 'data': None}), 400
+        if len(name) > 80:
+            return jsonify({'code': 0, 'msg': 'Template name is too long', 'data': None}), 400
+        if not isinstance(indicators, list):
+            return jsonify({'code': 0, 'msg': 'Indicators must be a list', 'data': None}), 400
+
+        sanitized = []
+        for item in indicators:
+            if not isinstance(item, dict):
+                continue
+            indicator_id = str(item.get('id') or '').strip()
+            instance_id = str(item.get('instanceId') or '').strip()
+            indicator_type = str(item.get('type') or '').strip()
+            if not indicator_id or not instance_id or not indicator_type:
+                continue
+            params = item.get('params') if isinstance(item.get('params'), dict) else {}
+            style = item.get('style') if isinstance(item.get('style'), dict) else {}
+            sanitized.append({
+                'id': indicator_id,
+                'instanceId': instance_id,
+                'name': str(item.get('name') or '').strip(),
+                'shortName': str(item.get('shortName') or '').strip(),
+                'type': indicator_type,
+                'visible': bool(item.get('visible', True)),
+                'params': params,
+                'style': {
+                    'color': str(style.get('color') or '').strip(),
+                    'lineWidth': int(style.get('lineWidth') or 2)
+                }
+            })
+
+        now_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+        _ensure_chart_templates_column()
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute("SELECT chart_templates FROM qd_users WHERE id = ?", (user_id,))
+            row = cur.fetchone()
+            raw = (row.get('chart_templates') if row else '') or ''
+            templates = []
+            if raw:
+                try:
+                    templates = json.loads(raw)
+                except Exception:
+                    templates = []
+            if not isinstance(templates, list):
+                templates = []
+
+            saved = None
+            updated_templates = []
+            if template_id:
+                for tpl in templates:
+                    if isinstance(tpl, dict) and str(tpl.get('id') or '') == template_id:
+                        tpl = {
+                            **tpl,
+                            'id': template_id,
+                            'name': name,
+                            'indicators': sanitized,
+                            'updated_at': now_iso
+                        }
+                        saved = tpl
+                    updated_templates.append(tpl)
+            else:
+                updated_templates = [tpl for tpl in templates if isinstance(tpl, dict)]
+
+            if saved is None:
+                saved = {
+                    'id': f"tpl_{int(time.time() * 1000)}",
+                    'name': name,
+                    'indicators': sanitized,
+                    'created_at': now_iso,
+                    'updated_at': now_iso
+                }
+                updated_templates.append(saved)
+
+            updated_templates = sorted(updated_templates, key=lambda x: str(x.get('updated_at') or ''), reverse=True)[:20]
+            cur.execute(
+                "UPDATE qd_users SET chart_templates = ?, updated_at = NOW() WHERE id = ?",
+                (json.dumps(updated_templates, ensure_ascii=False), user_id)
+            )
+            db.commit()
+            cur.close()
+
+        return jsonify({'code': 1, 'msg': 'Chart template saved', 'data': saved})
+    except Exception as e:
+        logger.error(f"save_chart_template failed: {e}")
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@user_blp.route('/chart-templates', methods=['DELETE'])
+@login_required
+def delete_chart_template():
+    """Delete a user's chart template by id."""
+    try:
+        user_id = getattr(g, 'user_id', None)
+        if not user_id:
+            return jsonify({'code': 0, 'msg': 'Not authenticated', 'data': None}), 401
+
+        template_id = str(request.args.get('template_id') or '').strip()
+        if not template_id:
+            return jsonify({'code': 0, 'msg': 'template_id is required', 'data': None}), 400
+
+        _ensure_chart_templates_column()
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute("SELECT chart_templates FROM qd_users WHERE id = ?", (user_id,))
+            row = cur.fetchone()
+            raw = (row.get('chart_templates') if row else '') or ''
+            templates = []
+            if raw:
+                try:
+                    templates = json.loads(raw)
+                except Exception:
+                    templates = []
+            if not isinstance(templates, list):
+                templates = []
+
+            updated_templates = [
+                tpl for tpl in templates
+                if not (isinstance(tpl, dict) and str(tpl.get('id') or '') == template_id)
+            ]
+            cur.execute(
+                "UPDATE qd_users SET chart_templates = ?, updated_at = NOW() WHERE id = ?",
+                (json.dumps(updated_templates, ensure_ascii=False), user_id)
+            )
+            db.commit()
+            cur.close()
+
+        return jsonify({'code': 1, 'msg': 'Chart template deleted', 'data': {'template_id': template_id}})
+    except Exception as e:
+        logger.error(f"delete_chart_template failed: {e}")
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@user_blp.route('/notification-settings/test', methods=['POST'])
 @login_required
 def test_notification_settings():
     """
@@ -739,6 +1041,7 @@ def test_notification_settings():
             'discord': (settings.get('discord_webhook') or '').strip(),
             'webhook': (settings.get('webhook_url') or '').strip(),
             'webhook_token': (settings.get('webhook_token') or '').strip(),
+            'webhook_signing_secret': (settings.get('webhook_signing_secret') or '').strip(),
         }
 
         accept = (request.headers.get('Accept-Language') or '') + ' ' + (request.headers.get('X-Locale') or '')
@@ -771,7 +1074,7 @@ def test_notification_settings():
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
-@user_bp.route('/change-password', methods=['POST'])
+@user_blp.route('/change-password', methods=['POST'])
 @login_required
 def change_password():
     """
@@ -861,7 +1164,82 @@ def _safe_json_loads(s, default=None):
         return default
 
 
-@user_bp.route('/system-strategies', methods=['GET'])
+def _strategy_exchange_display_name(
+    exchange_config: dict,
+    *,
+    credential_map: dict,
+    user_id: int = 0,
+) -> str:
+    """Resolve exchange label for admin strategy lists.
+
+    Strategies often persist ``exchange_config`` as ``{credential_id: N}`` only
+  (API secrets live in ``qd_exchange_credentials``).  Read inline ``exchange_id``
+    first, then the credential row's ``exchange_id``, then ``resolve_exchange_config``
+    as a last resort.
+    """
+    if not isinstance(exchange_config, dict):
+        return ''
+
+    direct = (
+        exchange_config.get('exchange_id')
+        or exchange_config.get('exchange')
+        or exchange_config.get('broker')
+        or ''
+    )
+    direct = str(direct or '').strip()
+    if direct:
+        return direct
+
+    cred_id = exchange_config.get('credential_id') or exchange_config.get('credentials_id')
+    if cred_id:
+        try:
+            row = credential_map.get(int(cred_id))
+        except (TypeError, ValueError):
+            row = None
+        if row:
+            ex = str(row.get('exchange_id') or '').strip()
+            if ex:
+                return ex
+
+        try:
+            from app.services.exchange_execution import resolve_exchange_config
+
+            resolved = resolve_exchange_config(exchange_config, user_id=int(user_id or 1))
+            ex = str(resolved.get('exchange_id') or resolved.get('exchange') or '').strip()
+            if ex:
+                return ex
+        except Exception:
+            pass
+
+    return ''
+
+
+def _batch_load_credential_exchange_map(credential_ids: set) -> dict:
+    """Map credential id -> {id, exchange_id, name} for display (no decrypt)."""
+    if not credential_ids:
+        return {}
+    ids = sorted({int(i) for i in credential_ids if i})
+    if not ids:
+        return {}
+    placeholders = ','.join(['?'] * len(ids))
+    credential_map = {}
+    with get_db_connection() as db:
+        cur = db.cursor()
+        cur.execute(
+            f"""
+            SELECT id, exchange_id, name
+            FROM qd_exchange_credentials
+            WHERE id IN ({placeholders})
+            """,
+            tuple(ids),
+        )
+        for row in (cur.fetchall() or []):
+            credential_map[int(row['id'])] = dict(row)
+        cur.close()
+    return credential_map
+
+
+@user_blp.route('/system-strategies', methods=['GET'])
 @login_required
 @admin_required
 def get_system_strategies():
@@ -874,7 +1252,9 @@ def get_system_strategies():
         page_size: int (default 20, max 100)
         status: str (optional, filter by status: running/stopped/all)
         execution_mode: str (optional, live/signal — omit or all for any)
-        search: str (optional, search by strategy name/symbol/username)
+        search: str (optional, search by strategy name/symbol/username/id)
+        strategy_id: int (optional, exact strategy id)
+        user_id: int (optional, exact owner user id)
         sort_by: str (optional, whitelist; default status+updated_at)
         sort_order: str (optional, asc or desc; default desc when sort_by set)
     """
@@ -884,6 +1264,8 @@ def get_system_strategies():
         status_filter = request.args.get('status', '', type=str).strip().lower()
         execution_filter = request.args.get('execution_mode', '', type=str).strip().lower()
         search = request.args.get('search', '', type=str).strip()
+        strategy_id_filter = _parse_positive_int(request.args.get('strategy_id'))
+        user_id_filter = _parse_positive_int(request.args.get('user_id'))
         sort_by = request.args.get('sort_by', '', type=str).strip().lower()
         sort_order = request.args.get('sort_order', 'desc', type=str).strip().lower()
         if sort_order not in ('asc', 'desc'):
@@ -905,7 +1287,7 @@ def get_system_strategies():
         sort_expr_map = {
             'total_pnl': (
                 "(COALESCE((SELECT SUM(unrealized_pnl) FROM qd_strategy_positions p WHERE p.strategy_id = s.id), 0)"
-                " + COALESCE((SELECT SUM(profit) FROM qd_strategy_trades t WHERE t.strategy_id = s.id), 0))"
+                " + COALESCE((SELECT SUM(COALESCE(t.profit, 0) - COALESCE(t.commission, 0)) FROM qd_strategy_trades t WHERE t.strategy_id = s.id), 0))"
             ),
             'trade_count': '(SELECT COUNT(*) FROM qd_strategy_trades t WHERE t.strategy_id = s.id)',
             'position_count': '(SELECT COUNT(*) FROM qd_strategy_positions p WHERE p.strategy_id = s.id)',
@@ -930,12 +1312,29 @@ def get_system_strategies():
                 conditions.append("s.execution_mode = ?")
                 params.append(execution_filter)
 
+            if strategy_id_filter > 0:
+                conditions.append("s.id = ?")
+                params.append(strategy_id_filter)
+
+            if user_id_filter > 0:
+                conditions.append("s.user_id = ?")
+                params.append(user_id_filter)
+
             if search:
-                conditions.append(
-                    "(s.strategy_name ILIKE ? OR s.symbol ILIKE ? OR u.username ILIKE ? OR u.nickname ILIKE ?)"
-                )
                 like_val = f"%{search}%"
-                params.extend([like_val, like_val, like_val, like_val])
+                if search.isdigit():
+                    num = int(search)
+                    conditions.append(
+                        "(s.id = ? OR s.user_id = ? OR s.strategy_name ILIKE ? OR s.symbol ILIKE ? "
+                        "OR u.username ILIKE ? OR u.nickname ILIKE ?)"
+                    )
+                    params.extend([num, num, like_val, like_val, like_val, like_val])
+                else:
+                    conditions.append(
+                        "(s.strategy_name ILIKE ? OR s.symbol ILIKE ? OR u.username ILIKE ? OR u.nickname ILIKE ?"
+                        " OR CAST(s.id AS TEXT) ILIKE ? OR CAST(s.user_id AS TEXT) ILIKE ?)"
+                    )
+                    params.extend([like_val, like_val, like_val, like_val, like_val, like_val])
 
             where_clause = ""
             if conditions:
@@ -965,6 +1364,7 @@ def get_system_strategies():
                     s.user_id,
                     s.strategy_name,
                     s.strategy_type,
+                    s.strategy_mode,
                     s.market_category,
                     s.execution_mode,
                     s.status,
@@ -1021,7 +1421,7 @@ def get_system_strategies():
                     f"""
                     SELECT strategy_id, 
                            COUNT(*) as trade_count, 
-                           COALESCE(SUM(profit), 0) as total_realized_pnl
+                           COALESCE(SUM(COALESCE(profit, 0) - COALESCE(commission, 0)), 0) as total_realized_pnl
                     FROM qd_strategy_trades
                     WHERE strategy_id IN ({placeholders})
                     GROUP BY strategy_id
@@ -1036,7 +1436,18 @@ def get_system_strategies():
 
             cur.close()
 
-        # Build response
+        # Build response — batch-resolve exchange names for credential_id-only configs.
+        cred_ids = set()
+        for s in strategies:
+            ec = _safe_json_loads(s.get('exchange_config'), {})
+            cid = ec.get('credential_id') or ec.get('credentials_id')
+            if cid:
+                try:
+                    cred_ids.add(int(cid))
+                except (TypeError, ValueError):
+                    pass
+        credential_map = _batch_load_credential_exchange_map(cred_ids)
+
         items = []
         for s in strategies:
             sid = s['id']
@@ -1048,11 +1459,23 @@ def get_system_strategies():
             indicator_name = ''
             if isinstance(indicator_config, dict):
                 indicator_name = indicator_config.get('indicator_name') or indicator_config.get('name') or ''
+            if not indicator_name and str(s.get('strategy_mode') or '').strip().lower() == 'bot':
+                if isinstance(trading_config, dict):
+                    indicator_name = (
+                        trading_config.get('bot_name')
+                        or s.get('strategy_name')
+                        or trading_config.get('bot_type')
+                        or ''
+                    )
+                else:
+                    indicator_name = s.get('strategy_name') or ''
 
-            # Extract exchange name
-            exchange_name = ''
-            if isinstance(exchange_config, dict):
-                exchange_name = exchange_config.get('exchange_id') or exchange_config.get('exchange') or ''
+            # Extract exchange name (inline config or saved credential reference).
+            exchange_name = _strategy_exchange_display_name(
+                exchange_config,
+                credential_map=credential_map,
+                user_id=int(s.get('user_id') or 0),
+            )
 
             # Positions data
             positions = positions_map.get(sid, [])
@@ -1077,18 +1500,10 @@ def get_system_strategies():
                 cs_type = trading_config.get('cs_strategy_type') or 'single'
                 symbol_list = trading_config.get('symbol_list') or []
 
-            # Format timestamps
+            # Timestamps are emitted as UTC ISO by SafeJSONProvider — pass
+            # datetime objects straight through.
             created_at = s.get('created_at')
             updated_at = s.get('updated_at')
-            if hasattr(created_at, 'isoformat'):
-                created_at = created_at.isoformat()
-            if hasattr(updated_at, 'isoformat'):
-                updated_at = updated_at.isoformat()
-
-            # Format position timestamps
-            for p in positions:
-                if hasattr(p.get('updated_at'), 'isoformat'):
-                    p['updated_at'] = p['updated_at'].isoformat()
 
             items.append({
                 'id': sid,
@@ -1160,9 +1575,9 @@ def get_system_strategies():
 
             # Aggregate realized pnl from trade history.
             realized_sql = f"""
-                SELECT COALESCE(SUM(t.profit), 0) AS total_realized,
-                       COALESCE(SUM(CASE WHEN s.execution_mode = 'live' THEN t.profit ELSE 0 END), 0) AS live_realized,
-                       COALESCE(SUM(CASE WHEN s.execution_mode = 'signal' THEN t.profit ELSE 0 END), 0) AS signal_realized
+                SELECT COALESCE(SUM(COALESCE(t.profit, 0) - COALESCE(t.commission, 0)), 0) AS total_realized,
+                       COALESCE(SUM(CASE WHEN s.execution_mode = 'live' THEN COALESCE(t.profit, 0) - COALESCE(t.commission, 0) ELSE 0 END), 0) AS live_realized,
+                       COALESCE(SUM(CASE WHEN s.execution_mode = 'signal' THEN COALESCE(t.profit, 0) - COALESCE(t.commission, 0) ELSE 0 END), 0) AS signal_realized
                 FROM qd_strategy_trades t
                 JOIN qd_strategies_trading s ON s.id = t.strategy_id
                 LEFT JOIN qd_users u ON u.id = s.user_id
@@ -1210,15 +1625,138 @@ def get_system_strategies():
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
+@user_blp.route('/system-strategies/toggle', methods=['POST'])
+@login_required
+@admin_required
+def admin_toggle_system_strategy():
+    """
+    Start or stop any strategy (admin only).
+
+    Query/body:
+        id / strategy_id: strategy primary key
+        action: optional ``start`` | ``stop`` — omit to toggle current status
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        strategy_id = (
+            request.args.get('id', type=int)
+            or data.get('strategy_id')
+            or data.get('id')
+        )
+        try:
+            strategy_id = int(strategy_id)
+        except (TypeError, ValueError):
+            strategy_id = 0
+        if strategy_id <= 0:
+            return jsonify({'code': 0, 'msg': 'Missing strategy id', 'data': None}), 400
+
+        action = str(data.get('action') or request.args.get('action') or '').strip().lower()
+
+        from app import get_trading_executor
+        from app.routes.strategy import get_strategy_service
+
+        svc = get_strategy_service()
+        st = svc.get_strategy(strategy_id)
+        if not st:
+            return jsonify({'code': 0, 'msg': 'Strategy not found', 'data': None}), 404
+
+        strategy_type = svc.get_strategy_type(strategy_id)
+        if strategy_type == 'PromptBasedStrategy':
+            return jsonify({
+                'code': 0,
+                'msg': 'AI strategy has been removed; cannot start/stop',
+                'data': None,
+            }), 400
+
+        current = str(st.get('status') or 'stopped').strip().lower()
+        if action in ('start', 'running', 'run'):
+            target = 'running'
+        elif action in ('stop', 'stopped', 'halt'):
+            target = 'stopped'
+        else:
+            target = 'stopped' if current == 'running' else 'running'
+
+        executor = get_trading_executor()
+        admin_user_id = getattr(g, 'user_id', None)
+
+        if target == 'running':
+            svc.update_strategy_status(strategy_id, 'running')
+            ok = executor.start_strategy(strategy_id)
+            if not ok:
+                svc.update_strategy_status(strategy_id, 'stopped')
+                detail = getattr(executor, '_last_start_failure', '') or ''
+                msg = 'Failed to start strategy executor'
+                if detail:
+                    msg = f'{msg}: {detail}'
+                return jsonify({'code': 0, 'msg': msg, 'data': {'status': 'stopped'}}), 500
+            alive, hint = executor.wait_strategy_running(strategy_id, timeout=3.0)
+            if not alive:
+                svc.update_strategy_status(strategy_id, 'stopped')
+                msg = f'策略启动后立即退出: {hint}'
+                return jsonify({
+                    'code': 0,
+                    'msg': msg,
+                    'data': {'id': strategy_id, 'status': 'stopped', 'detail': hint},
+                }), 500
+            logger.info(
+                'Admin %s started strategy %s (owner user_id=%s)',
+                admin_user_id, strategy_id, st.get('user_id'),
+            )
+        else:
+            executor.stop_strategy(strategy_id)
+            svc.update_strategy_status(strategy_id, 'stopped')
+            logger.info(
+                'Admin %s stopped strategy %s (owner user_id=%s)',
+                admin_user_id, strategy_id, st.get('user_id'),
+            )
+
+        return jsonify({
+            'code': 1,
+            'msg': 'Started successfully' if target == 'running' else 'Stopped successfully',
+            'data': {'id': strategy_id, 'status': target},
+        })
+    except Exception as e:
+        logger.error(f"admin_toggle_system_strategy failed: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
 # ==================== Admin Orders ====================
 
-@user_bp.route('/admin-orders', methods=['GET'])
+
+def _ensure_usdt_admin_columns():
+    """Best-effort: extend qd_usdt_orders with admin-audit columns introduced
+    by the manual-confirm flow. ``ADD COLUMN IF NOT EXISTS`` is idempotent
+    on PostgreSQL, so this is effectively a no-op after the first hit.
+
+    Failures are swallowed (logged at debug level) so a running DB user
+    without DDL privileges doesn't block the read paths — the SELECTs
+    further down use ``information_schema`` checks or COALESCE to tolerate
+    the columns being absent.
+    """
+    try:
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                "ALTER TABLE qd_usdt_orders ADD COLUMN IF NOT EXISTS admin_note TEXT DEFAULT NULL"
+            )
+            cur.execute(
+                "ALTER TABLE qd_usdt_orders ADD COLUMN IF NOT EXISTS manual_confirmed_by INTEGER DEFAULT NULL"
+            )
+            db.commit()
+            cur.close()
+    except Exception as exc:
+        logger.debug("ensure_usdt_admin_columns skipped: %s", exc)
+
+
+@user_blp.route('/admin-orders', methods=['GET'])
 @login_required
 @admin_required
 def get_admin_orders():
     """
     Get all orders across the system (admin only).
-    Merges qd_membership_orders and qd_usdt_orders into a unified list.
+    Lists USDT on-chain membership orders only (qd_usdt_orders).
 
     Query params:
         page: int (default 1)
@@ -1234,10 +1772,11 @@ def get_admin_orders():
         page_size = min(100, max(1, page_size))
         offset = (page - 1) * page_size
 
+        _ensure_usdt_admin_columns()
+
         with get_db_connection() as db:
             cur = db.cursor()
 
-            # --- USDT Orders (primary) ---
             usdt_conditions = []
             usdt_params = []
 
@@ -1254,93 +1793,42 @@ def get_admin_orders():
             if usdt_conditions:
                 usdt_where = "WHERE " + " AND ".join(usdt_conditions)
 
-            # Count
             cur.execute(
                 f"SELECT COUNT(*) as cnt FROM qd_usdt_orders o LEFT JOIN qd_users u ON u.id = o.user_id {usdt_where}",
                 tuple(usdt_params)
             )
-            usdt_total = cur.fetchone()['cnt']
+            total = cur.fetchone()['cnt']
 
-            # --- Membership Orders (mock) ---
-            mock_conditions = []
-            mock_params = []
-
-            if status_filter and status_filter != 'all':
-                mock_conditions.append("m.status = ?")
-                mock_params.append(status_filter)
-
-            if search:
-                mock_conditions.append("(u.username ILIKE ? OR u.email ILIKE ? OR u.nickname ILIKE ?)")
-                like_val = f"%{search}%"
-                mock_params.extend([like_val, like_val, like_val])
-
-            mock_where = ""
-            if mock_conditions:
-                mock_where = "WHERE " + " AND ".join(mock_conditions)
-
-            cur.execute(
-                f"SELECT COUNT(*) as cnt FROM qd_membership_orders m LEFT JOIN qd_users u ON u.id = m.user_id {mock_where}",
-                tuple(mock_params)
-            )
-            mock_total = cur.fetchone()['cnt']
-
-            total = usdt_total + mock_total
-
-            # Use UNION ALL to merge both tables into one sorted list
-            # We select a unified schema
-            union_sql = f"""
-                SELECT * FROM (
-                    SELECT
-                        o.id,
-                        'usdt' AS order_type,
-                        o.user_id,
-                        u.username,
-                        u.nickname,
-                        u.email AS user_email,
-                        o.plan,
-                        o.amount_usdt AS amount,
-                        'USDT' AS currency,
-                        o.chain,
-                        o.address,
-                        o.tx_hash,
-                        o.status,
-                        o.created_at,
-                        o.paid_at,
-                        o.confirmed_at,
-                        o.expires_at
-                    FROM qd_usdt_orders o
-                    LEFT JOIN qd_users u ON u.id = o.user_id
-                    {usdt_where}
-
-                    UNION ALL
-
-                    SELECT
-                        m.id,
-                        'mock' AS order_type,
-                        m.user_id,
-                        u.username,
-                        u.nickname,
-                        u.email AS user_email,
-                        m.plan,
-                        m.price_usd AS amount,
-                        'USD' AS currency,
-                        '' AS chain,
-                        '' AS address,
-                        '' AS tx_hash,
-                        m.status,
-                        m.created_at,
-                        m.paid_at,
-                        NULL AS confirmed_at,
-                        NULL AS expires_at
-                    FROM qd_membership_orders m
-                    LEFT JOIN qd_users u ON u.id = m.user_id
-                    {mock_where}
-                ) AS combined
-                ORDER BY combined.created_at DESC
+            list_sql = f"""
+                SELECT
+                    o.id,
+                    'usdt' AS order_type,
+                    o.user_id,
+                    u.username,
+                    u.nickname,
+                    u.email AS user_email,
+                    o.plan,
+                    o.amount_usdt AS amount,
+                    'USDT' AS currency,
+                    o.chain,
+                    o.address,
+                    o.tx_hash,
+                    o.status,
+                    o.matched_via,
+                    o.admin_note,
+                    o.manual_confirmed_by,
+                    o.created_at,
+                    o.paid_at,
+                    o.confirmed_at,
+                    o.expires_at
+                FROM qd_usdt_orders o
+                LEFT JOIN qd_users u ON u.id = o.user_id
+                {usdt_where}
+                ORDER BY o.created_at DESC
                 LIMIT ? OFFSET ?
             """
-            all_params = list(usdt_params) + list(mock_params) + [page_size, offset]
-            cur.execute(union_sql, tuple(all_params))
+            all_params = list(usdt_params) + [page_size, offset]
+            cur.execute(list_sql, tuple(all_params))
             rows = cur.fetchall() or []
 
             # Summary stats
@@ -1359,18 +1847,12 @@ def get_admin_orders():
 
         items = []
         for row in rows:
+            # SafeJSONProvider normalizes datetimes to UTC ISO; no manual
+            # conversion needed.
             created_at = row.get('created_at')
             paid_at = row.get('paid_at')
             confirmed_at = row.get('confirmed_at')
             expires_at = row.get('expires_at')
-            if hasattr(created_at, 'isoformat'):
-                created_at = created_at.isoformat()
-            if hasattr(paid_at, 'isoformat'):
-                paid_at = paid_at.isoformat()
-            if hasattr(confirmed_at, 'isoformat'):
-                confirmed_at = confirmed_at.isoformat()
-            if hasattr(expires_at, 'isoformat'):
-                expires_at = expires_at.isoformat()
 
             items.append({
                 'id': row['id'],
@@ -1386,6 +1868,9 @@ def get_admin_orders():
                 'address': row.get('address') or '',
                 'tx_hash': row.get('tx_hash') or '',
                 'status': row.get('status') or '',
+                'matched_via': row.get('matched_via') or '',
+                'admin_note': row.get('admin_note') or '',
+                'manual_confirmed_by': row.get('manual_confirmed_by'),
                 'created_at': created_at,
                 'paid_at': paid_at,
                 'confirmed_at': confirmed_at,
@@ -1416,9 +1901,170 @@ def get_admin_orders():
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
+@user_blp.route('/admin-orders/<int:order_id>/manual-confirm', methods=['POST'])
+@login_required
+@admin_required
+def manual_confirm_order(order_id: int):
+    """
+    Admin-only "rescue" lever for USDT orders.
+
+    Use case: the buyer paid the correct amount to the correct receiving
+    address, but the on-chain reconciler missed the transaction (RPC
+    outage, exotic wallet, chain-specific edge case, off-chain mistake
+    where the customer used a slightly different amount than the order
+    suffix demanded, etc.). Without this endpoint the admin's only option
+    is to ``UPDATE qd_usdt_orders ...`` by hand and then somehow trigger
+    ``purchase_membership``; this surface does both atomically and leaves
+    an audit trail.
+
+    Body:
+        {
+            "tx_hash": "<on-chain tx hash>",     # required
+            "note":    "<free-form audit note>"  # optional
+        }
+
+    Behavior:
+        - Flips the order to 'confirmed'.
+        - Stamps tx_hash + paid_at (if empty) + confirmed_at + admin_note
+          + manual_confirmed_by + matched_via='manual_admin'.
+        - Calls ``purchase_membership`` exactly once per order (idempotent
+          on re-submit — already-confirmed orders only refresh the audit
+          fields, no double-grant).
+        - Refuses ``status='cancelled'`` orders so the admin doesn't
+          accidentally resurrect a deliberately-cancelled refund.
+    """
+    try:
+        admin_user_id = getattr(g, 'user_id', None)
+        body = request.get_json(silent=True) or {}
+        tx_hash = (body.get('tx_hash') or '').strip()
+        note = (body.get('note') or '').strip()
+
+        if not tx_hash:
+            return jsonify({'code': 0, 'msg': 'missing_tx_hash', 'data': None}), 400
+        if len(tx_hash) > 120:
+            return jsonify({'code': 0, 'msg': 'tx_hash_too_long', 'data': None}), 400
+        if len(note) > 1000:
+            return jsonify({'code': 0, 'msg': 'note_too_long', 'data': None}), 400
+
+        _ensure_usdt_admin_columns()
+
+        # Load order in a short read txn (don't hold a lock across the
+        # billing call below — purchase_membership opens its own conn).
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                """
+                SELECT id, user_id, plan, status, chain
+                FROM qd_usdt_orders WHERE id = ?
+                """,
+                (order_id,),
+            )
+            order = cur.fetchone()
+            cur.close()
+
+        if not order:
+            return jsonify({'code': 0, 'msg': 'order_not_found', 'data': None}), 404
+
+        current_status = (order.get('status') or '').lower()
+        user_id = order.get('user_id')
+        plan = order.get('plan')
+
+        if current_status == 'cancelled':
+            # Cancelled orders are deliberately retired — surfacing this
+            # as an error forces the admin to recreate the order instead
+            # of silently rescuing a refunded one.
+            return jsonify({
+                'code': 0,
+                'msg': 'order_cancelled',
+                'data': {'order_id': order_id, 'status': current_status},
+            }), 400
+
+        already_confirmed = current_status == 'confirmed'
+
+        # Stamp confirmation + audit fields. COALESCE on paid_at /
+        # confirmed_at means re-running this for amendments (e.g. fix a
+        # typo in the tx hash) preserves the original timestamps.
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                """
+                UPDATE qd_usdt_orders
+                SET status = 'confirmed',
+                    tx_hash = ?,
+                    paid_at = COALESCE(paid_at, NOW()),
+                    confirmed_at = COALESCE(confirmed_at, NOW()),
+                    admin_note = ?,
+                    manual_confirmed_by = ?,
+                    matched_via = 'manual_admin',
+                    updated_at = NOW()
+                WHERE id = ?
+                """,
+                (tx_hash, note or None, admin_user_id, order_id),
+            )
+            db.commit()
+            cur.close()
+
+        # Grant membership only when transitioning into 'confirmed' for
+        # the first time — re-submits (already confirmed) should only
+        # update the audit fields above, never grant another membership.
+        billing_msg = ''
+        if not already_confirmed:
+            try:
+                from app.services.billing_service import get_billing_service
+                billing = get_billing_service()
+                ok, billing_msg, _ = billing.purchase_membership(
+                    int(user_id),
+                    str(plan),
+                    record_membership_order=False,
+                    fulfillment_ref=f"manual_usdt:{order_id}:by_{admin_user_id}",
+                )
+                logger.info(
+                    "[ManualConfirm] order=%s user=%s plan=%s admin=%s ok=%s msg=%s",
+                    order_id, user_id, plan, admin_user_id, ok, billing_msg,
+                )
+                if not ok:
+                    # Order row is already 'confirmed' at this point;
+                    # surface the billing error so the admin knows to
+                    # retry / dig in. We deliberately don't roll back the
+                    # status because the on-chain payment IS real.
+                    return jsonify({
+                        'code': 0,
+                        'msg': f'order_confirmed_but_billing_failed:{billing_msg}',
+                        'data': {'order_id': order_id, 'billing_error': billing_msg},
+                    }), 500
+            except Exception as exc:
+                logger.error(
+                    "[ManualConfirm] billing exception order=%s err=%s",
+                    order_id, exc, exc_info=True,
+                )
+                return jsonify({
+                    'code': 0,
+                    'msg': f'order_confirmed_but_billing_exception:{exc}',
+                    'data': {'order_id': order_id},
+                }), 500
+
+        return jsonify({
+            'code': 1,
+            'msg': 'success',
+            'data': {
+                'order_id': order_id,
+                'user_id': user_id,
+                'plan': plan,
+                'status': 'confirmed',
+                'tx_hash': tx_hash,
+                'admin_note': note,
+                'manual_confirmed_by': admin_user_id,
+                'already_confirmed': already_confirmed,
+            },
+        })
+    except Exception as e:
+        logger.error(f"manual_confirm_order failed: {e}", exc_info=True)
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
 # ==================== Admin AI Analysis Stats ====================
 
-@user_bp.route('/admin-ai-stats', methods=['GET'])
+@user_blp.route('/admin-ai-stats', methods=['GET'])
 @login_required
 @admin_required
 def get_admin_ai_stats():
@@ -1577,30 +2223,19 @@ def get_admin_ai_stats():
             cur.close()
 
         # Build per-user items
+        from app.utils.timeutil import to_utc_iso
+
         user_items = []
         for row in user_rows:
             uid = row.get('user_id')
             if not uid:  # Skip rows with NULL user_id
                 continue
-                
+
             ms = memory_stats_map.get(uid, {})
-            last_at = row.get('last_analysis_at')
-            first_at = row.get('first_analysis_at')
-            
-            # Convert datetime to ISO format string if needed
-            if last_at and hasattr(last_at, 'isoformat'):
-                last_at = last_at.isoformat()
-            elif last_at:
-                last_at = str(last_at)
-            else:
-                last_at = None
-                
-            if first_at and hasattr(first_at, 'isoformat'):
-                first_at = first_at.isoformat()
-            elif first_at:
-                first_at = str(first_at)
-            else:
-                first_at = None
+            # Server stores naive TIMESTAMP in container TZ; emit UTC ISO so the
+            # browser can render it in the user's locale correctly.
+            last_at = to_utc_iso(row.get('last_analysis_at'))
+            first_at = to_utc_iso(row.get('first_analysis_at'))
 
             user_items.append({
                 'user_id': int(uid),
@@ -1624,24 +2259,9 @@ def get_admin_ai_stats():
             user_id = row.get('user_id')
             if not user_id:  # Skip rows with NULL user_id
                 continue
-                
-            created_at = row.get('created_at')
-            completed_at = row.get('completed_at')
-            
-            # Convert datetime to ISO format string if needed
-            if created_at and hasattr(created_at, 'isoformat'):
-                created_at = created_at.isoformat()
-            elif created_at:
-                created_at = str(created_at)
-            else:
-                created_at = None
-                
-            if completed_at and hasattr(completed_at, 'isoformat'):
-                completed_at = completed_at.isoformat()
-            elif completed_at:
-                completed_at = str(completed_at)
-            else:
-                completed_at = None
+
+            created_at = to_utc_iso(row.get('created_at'))
+            completed_at = to_utc_iso(row.get('completed_at'))
 
             recent_items.append({
                 'id': int(row.get('id') or 0),
@@ -1684,3 +2304,28 @@ def get_admin_ai_stats():
         import traceback
         logger.error(traceback.format_exc())
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+# ==================== Admin User Dashboard Stats ====================
+
+@user_blp.route('/admin/stats', methods=['GET'])
+@login_required
+@admin_required
+def get_admin_user_stats():
+    """KPI dashboard data for the User Management tab (admin only).
+
+    Returns a single envelope with `summary`, `growth`, `activity`.
+    See `app.services.user_stats_service` for the schema of each section.
+    """
+    try:
+        from app.services.user_stats_service import get_user_admin_stats
+
+        data = get_user_admin_stats()
+        return jsonify({'code': 1, 'msg': 'success', 'data': data})
+    except Exception as e:
+        logger.error(f"get_admin_user_stats failed: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+# openapi-compat: legacy import name
+user_bp = user_blp

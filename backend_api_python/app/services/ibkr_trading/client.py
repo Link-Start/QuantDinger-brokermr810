@@ -56,7 +56,7 @@ def _ensure_ib_insync():
 class IBKRConfig:
     """IBKR connection configuration."""
     host: str = "127.0.0.1"
-    port: int = 7497  # TWS Live:7497, TWS Paper:7496, Gateway Live:4001, Gateway Paper:4002
+    port: int = 7497  # TWS Live:7496, TWS Paper:7497, Gateway Live:4001, Gateway Paper:4002
     client_id: int = 1
     readonly: bool = False
     account: str = ""  # Leave empty to auto-select first account
@@ -80,7 +80,7 @@ class IBKRClient:
     Interactive Brokers Trading Client
     
     Usage:
-        config = IBKRConfig(port=7497)  # TWS Live
+        config = IBKRConfig(port=7497)  # TWS Paper default
         client = IBKRClient(config)
         
         if client.connect():
@@ -246,16 +246,19 @@ class IBKRClient:
             # Wait for order status update
             self._ib.sleep(2)
             
+            status = trade.orderStatus.status
+            rejected = status in ("Cancelled", "ApiCancelled", "Inactive")
+            
             return OrderResult(
-                success=True,
+                success=not rejected,
                 order_id=trade.order.orderId,
                 filled=float(trade.orderStatus.filled or 0),
                 avg_price=float(trade.orderStatus.avgFillPrice or 0),
-                status=trade.orderStatus.status,
-                message="Order submitted",
+                status=status,
+                message=f"Order {status}" if rejected else "Order submitted",
                 raw={
                     "orderId": trade.order.orderId,
-                    "status": trade.orderStatus.status,
+                    "status": status,
                     "filled": float(trade.orderStatus.filled or 0),
                     "remaining": float(trade.orderStatus.remaining or 0),
                 }
@@ -310,16 +313,19 @@ class IBKRClient:
             trade = self._ib.placeOrder(contract, order)
             self._ib.sleep(1)
             
+            status = trade.orderStatus.status
+            rejected = status in ("Cancelled", "ApiCancelled", "Inactive")
+            
             return OrderResult(
-                success=True,
+                success=not rejected,
                 order_id=trade.order.orderId,
                 filled=float(trade.orderStatus.filled or 0),
                 avg_price=float(trade.orderStatus.avgFillPrice or 0),
-                status=trade.orderStatus.status,
-                message="Limit order submitted",
+                status=status,
+                message=f"Limit order {status}" if rejected else "Limit order submitted",
                 raw={
                     "orderId": trade.order.orderId,
-                    "status": trade.orderStatus.status,
+                    "status": status,
                     "limitPrice": price,
                 }
             )

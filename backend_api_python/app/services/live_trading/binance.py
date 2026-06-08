@@ -7,21 +7,25 @@ API docs (reference):
 
 from __future__ import annotations
 
-import hmac
 import hashlib
+import hmac
+import logging
 import time
 from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlencode
 
 from app.services.live_trading.base import BaseRestClient, LiveOrderResult, LiveTradingError
+
+logger = logging.getLogger(__name__)
 from app.services.live_trading.symbols import to_binance_futures_symbol
 
 
 class BinanceFuturesClient(BaseRestClient):
     def __init__(self, *, api_key: str, secret_key: str, base_url: str = None, enable_demo_trading: bool = False, timeout_sec: float = 15.0, broker_id: str = ""):
         if not base_url:
-            base_url = "https://demo-fapi.binance.com" if enable_demo_trading else "https://fapi.binance.com"
+            # Binance USDT-M Futures Testnet (official): https://testnet.binancefuture.com
+            base_url = "https://testnet.binancefuture.com" if enable_demo_trading else "https://fapi.binance.com"
 
         super().__init__(base_url=base_url, timeout_sec=timeout_sec)
         self.api_key = (api_key or "").strip()
@@ -373,48 +377,29 @@ class BinanceFuturesClient(BaseRestClient):
         except Exception:
             fdict = {}
 
-        key = "MARKET_LOT_SIZE" if for_market else "LOT_SIZE"
-        filt = fdict.get(key) or fdict.get("LOT_SIZE") or {}
+        from app.services.live_trading.binance_spot import BinanceSpotClient as _BSC
+
+        filt = _BSC._pick_lot_filter(fdict, for_market=for_market)
 
         step = self._to_dec((filt or {}).get("stepSize") or "0")
         min_qty = self._to_dec((filt or {}).get("minQty") or "0")
 
         if step > 0:
             q = self._floor_to_step(q, step)
-        
-        # Enforce quantity precision cap (Binance may reject quantities with too many decimals: -1111).
-        # First try to get precision from metadata
-        qty_precision = None
+
+        step_precision = _BSC._decimal_places_from_step(step)
+        qty_precision = step_precision
         try:
             meta = fdict.get("_meta") or {}
-            if isinstance(meta, dict):
-                qty_precision = meta.get("quantityPrecision")
+            if isinstance(meta, dict) and meta.get("quantityPrecision") is not None:
+                meta_prec = int(meta.get("quantityPrecision"))
+                if step_precision is None:
+                    qty_precision = meta_prec
+                else:
+                    qty_precision = min(meta_prec, step_precision)
         except Exception:
             pass
-        
-        # If precision not available, infer from stepSize
-        if qty_precision is None and step > 0:
-            try:
-                # stepSize like "0.001" means 3 decimal places
-                # Use normalize() to remove trailing zeros, then count decimal places
-                step_normalized = step.normalize()
-                step_str = str(step_normalized)
-                if '.' in step_str:
-                    # Count decimal places after removing trailing zeros
-                    decimal_part = step_str.split('.')[1]
-                    qty_precision = len(decimal_part)
-                    # Ensure precision is at least 0 and at most 18
-                    if qty_precision < 0:
-                        qty_precision = 0
-                    if qty_precision > 18:
-                        qty_precision = 18
-                else:
-                    # If stepSize is 1 or larger, precision is 0
-                    qty_precision = 0
-            except Exception:
-                pass
-        
-        # Apply precision limit
+
         if qty_precision is not None:
             q = self._floor_to_precision(q, qty_precision)
         
@@ -456,33 +441,51 @@ class BinanceFuturesClient(BaseRestClient):
         data = self._signed_request("GET", "/fapi/v1/userTrades", params=params)
         return data
 
-    def get_fee_for_order(self, *, symbol: str, order_id: str) -> Tuple[float, str]:
+    def get_fee_for_order(self, *, symbol: str, order_id: str, max_retries: int = 3) -> Tuple[float, str]:
         """
         Best-effort: sum commissions from fills for a specific order.
+        Retries a few times because userTrades may lag behind order fill.
 
         Returns: (total_fee, fee_ccy)
         """
-        try:
-            trades = self.get_user_trades(symbol=symbol, order_id=str(order_id or ""), limit=200)
-        except Exception:
-            trades = []
-        if not isinstance(trades, list):
-            return 0.0, ""
-        total_fee = 0.0
-        fee_ccy = ""
-        for t in trades:
-            if not isinstance(t, dict):
-                continue
+        for attempt in range(max(1, max_retries)):
             try:
-                fee = float(t.get("commission") or 0.0)
+                trades = self.get_user_trades(symbol=symbol, order_id=str(order_id or ""), limit=200)
             except Exception:
-                fee = 0.0
-            ccy = str(t.get("commissionAsset") or "").strip()
-            if fee != 0.0:
-                total_fee += abs(float(fee))
-                if (not fee_ccy) and ccy:
-                    fee_ccy = ccy
-        return float(total_fee), str(fee_ccy or "")
+                trades = []
+            if not isinstance(trades, list):
+                trades = []
+            total_fee = 0.0
+            fee_ccy = ""
+            for t in trades:
+                if not isinstance(t, dict):
+                    continue
+                try:
+                    fee = float(t.get("commission") or 0.0)
+                except Exception:
+                    fee = 0.0
+                ccy = str(t.get("commissionAsset") or "").strip()
+                if fee != 0.0:
+                    total_fee += abs(float(fee))
+                    if (not fee_ccy) and ccy:
+                        fee_ccy = ccy
+            if total_fee > 0 or attempt >= max_retries - 1:
+                return float(total_fee), str(fee_ccy or "")
+            time.sleep(1.0)
+        return 0.0, ""
+
+    def get_fee_rate(self, symbol: str, market_type: str = "swap") -> Optional[Dict[str, float]]:
+        sym = symbol.upper().replace("-", "").replace("/", "")
+        try:
+            data = self._signed_request("GET", "/fapi/v1/commissionRate", params={"symbol": sym})
+            if isinstance(data, dict):
+                maker = abs(float(data.get("makerCommissionRate") or 0))
+                taker = abs(float(data.get("takerCommissionRate") or 0))
+                if maker > 0 or taker > 0:
+                    return {"maker": maker, "taker": taker}
+        except Exception as e:
+            logger.warning(f"Binance get_fee_rate({symbol}) failed: {e}")
+        return None
 
     def set_leverage(self, *, symbol: str, leverage: float) -> Dict[str, Any]:
         """
@@ -598,12 +601,15 @@ class BinanceFuturesClient(BaseRestClient):
         poll_interval_sec: float = 0.5,
     ) -> Dict[str, Any]:
         """
-        Poll order detail to obtain (best-effort) executed quantity and average price.
+        Poll order detail to obtain (best-effort) executed quantity, average price,
+        and commission (via userTrades).
 
         Returns:
         {
           "filled": float,
           "avg_price": float,
+          "fee": float,
+          "fee_ccy": str,
           "status": str,
           "order": {...}
         }
@@ -623,7 +629,6 @@ class BinanceFuturesClient(BaseRestClient):
             except Exception:
                 filled = 0.0
 
-            # Futures order endpoint usually provides avgPrice; fall back to price/cumQuote.
             avg_price = 0.0
             try:
                 if last.get("avgPrice") is not None and str(last.get("avgPrice")).strip() != "":
@@ -644,14 +649,70 @@ class BinanceFuturesClient(BaseRestClient):
                     avg_price = 0.0
 
             if filled > 0 and avg_price > 0:
-                return {"filled": filled, "avg_price": avg_price, "status": status, "order": last}
+                fee, fee_ccy = self._fetch_commission_for_order(symbol=symbol, order_id=order_id, filled=filled, avg_price=avg_price)
+                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
 
             if status in ("FILLED", "CANCELED", "EXPIRED", "REJECTED"):
-                return {"filled": filled, "avg_price": avg_price, "status": status, "order": last}
+                fee, fee_ccy = 0.0, ""
+                if filled > 0:
+                    fee, fee_ccy = self._fetch_commission_for_order(symbol=symbol, order_id=order_id, filled=filled, avg_price=avg_price)
+                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
 
             if time.time() >= end_ts:
-                return {"filled": filled, "avg_price": avg_price, "status": status, "order": last}
+                fee, fee_ccy = 0.0, ""
+                if filled > 0:
+                    fee, fee_ccy = self._fetch_commission_for_order(symbol=symbol, order_id=order_id, filled=filled, avg_price=avg_price)
+                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
             time.sleep(float(poll_interval_sec or 0.5))
+
+    def _fetch_commission_for_order(self, *, symbol: str, order_id: str, filled: float, avg_price: float) -> Tuple[float, str]:
+        """Fetch real commission from userTrades; fall back to commissionRate calculation."""
+        oid = str(order_id or "").strip()
+        # Method 1: userTrades (up to 3 attempts with 1s delay)
+        for attempt in range(3):
+            try:
+                trades = self.get_user_trades(symbol=symbol, order_id=oid, limit=200) if oid else []
+                if not isinstance(trades, list):
+                    trades = []
+                total_fee = 0.0
+                fee_ccy = ""
+                for t in trades:
+                    if not isinstance(t, dict):
+                        continue
+                    try:
+                        c = float(t.get("commission") or 0.0)
+                    except (ValueError, TypeError):
+                        c = 0.0
+                    ccy = str(t.get("commissionAsset") or "").strip()
+                    if c != 0.0:
+                        total_fee += abs(c)
+                        if not fee_ccy and ccy:
+                            fee_ccy = ccy
+                if total_fee > 0:
+                    logger.debug("Binance fee via userTrades: %.8f %s (order=%s, attempt=%d)", total_fee, fee_ccy, oid, attempt)
+                    return total_fee, fee_ccy
+                if attempt < 2:
+                    time.sleep(1.5)
+            except Exception as e:
+                logger.warning("Binance userTrades fee query failed (attempt=%d): %s", attempt, e)
+                if attempt < 2:
+                    time.sleep(1.0)
+
+        # Method 2: calculate from commissionRate
+        if filled > 0 and avg_price > 0:
+            try:
+                rate_info = self.get_fee_rate(symbol=symbol)
+                if rate_info:
+                    taker_rate = float(rate_info.get("taker") or 0.0)
+                    if taker_rate > 0:
+                        calc_fee = filled * avg_price * taker_rate
+                        logger.info("Binance fee via commissionRate: %.8f USDT (rate=%.6f, order=%s)", calc_fee, taker_rate, oid)
+                        return calc_fee, "USDT"
+            except Exception as e:
+                logger.warning("Binance commissionRate fallback failed: %s", e)
+
+        logger.warning("Binance could not obtain fee for order=%s symbol=%s", oid, symbol)
+        return 0.0, ""
 
     def place_market_order(
         self,

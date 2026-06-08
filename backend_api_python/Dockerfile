@@ -1,54 +1,81 @@
 # QuantDinger Backend API Dockerfile
-# BASE_IMAGE can be overridden from docker-compose/.env.
+# BASE_IMAGE can be overridden from docker-compose (e.g. IMAGE_PREFIX for mirror pulls).
 ARG BASE_IMAGE=python:3.12-slim-bookworm
 FROM ${BASE_IMAGE}
 
-# Set working directory
+# BUILD_REGION switches apt/PyPI sources:
+#   cn      -> Aliyun mirrors first, fall back to official on failure (default; zero-config for China)
+#   global  -> use Debian/PyPI official directly, skip Aliyun entirely (used by GitHub Actions runners)
+ARG BUILD_REGION=cn
+ARG APP_VERSION=""
+ARG GIT_TAG=""
+
 WORKDIR /app
 
-# Use HTTPS mirror and install minimal runtime dependencies.
-# Keep image lean to avoid long downloads of full compiler toolchains.
-RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/*.sources 2>/dev/null || true \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends --fix-missing \
-    curl \
-    # Build deps (needed for some pyproject-based packages like ed25519-blake2b)
-    build-essential \
-    python3-dev \
-    libffi-dev \
-    libssl-dev \
+# Apt: when BUILD_REGION=cn, try Aliyun Debian mirror first (typical win in mainland) and
+# restore official on failure. Otherwise go straight to official sources so overseas
+# builders (e.g. GitHub-hosted runners) don't waste time hitting cn mirrors.
+RUN set -eux; \
+    APT_TIMEOUT='Acquire::http::Timeout=35'; \
+    if [ "$BUILD_REGION" = "cn" ]; then \
+      if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+        cp /etc/apt/sources.list.d/debian.sources /tmp/debian.sources.bak; \
+        sed -i -E \
+          's|https?://deb.debian.org|https://mirrors.aliyun.com|g; s|https?://security.debian.org|https://mirrors.aliyun.com|g' \
+          /etc/apt/sources.list.d/debian.sources; \
+        if ! apt-get -o "$APT_TIMEOUT" -o Acquire::https::Timeout=35 update; then \
+          cp /tmp/debian.sources.bak /etc/apt/sources.list.d/debian.sources; \
+          sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/*.sources 2>/dev/null || true; \
+          apt-get -o "$APT_TIMEOUT" update; \
+        fi; \
+      else \
+        sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/*.sources 2>/dev/null || true; \
+        apt-get -o "$APT_TIMEOUT" update; \
+      fi; \
+    else \
+      apt-get -o "$APT_TIMEOUT" update; \
+    fi; \
+    apt-get install -y --no-install-recommends --fix-missing \
+      ca-certificates \
+      curl \
+      build-essential \
+      python3-dev \
+      libffi-dev \
+      libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy dependency file
 COPY requirements.txt .
 
-# Install Python dependencies
-RUN pip install --no-cache-dir --prefer-binary --timeout 120 -r requirements.txt \
-    # Remove build deps to keep image small
-    && apt-get purge -y --auto-remove build-essential python3-dev libffi-dev libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
+# Pip: when BUILD_REGION=cn, try Aliyun PyPI first; on any failure retry default index.
+# Otherwise install from PyPI official directly.
+RUN set -eux; \
+    if [ "$BUILD_REGION" = "cn" ]; then \
+      pip install --no-cache-dir --prefer-binary --timeout 180 \
+          -i https://mirrors.aliyun.com/pypi/simple/ \
+          -r requirements.txt \
+        || pip install --no-cache-dir --prefer-binary --timeout 180 -r requirements.txt; \
+    else \
+      pip install --no-cache-dir --prefer-binary --timeout 180 -r requirements.txt; \
+    fi; \
+    apt-get purge -y --auto-remove build-essential python3-dev libffi-dev libssl-dev; \
+    rm -rf /var/lib/apt/lists/*
 
-# Copy application code
 COPY . .
 
-# Copy and set up entrypoint script
+RUN printf '%s\n' "$APP_VERSION" > /app/BUILD_VERSION \
+    && printf '%s\n' "$GIT_TAG" > /app/BUILD_GIT_TAG
+
 COPY docker-entrypoint.sh /usr/local/bin/
 RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh \
     && chmod +x /usr/local/bin/docker-entrypoint.sh
 
-# Create log and data directories
 RUN mkdir -p logs data/memory
 
-# Expose port
 EXPOSE 5000
 
-# Environment variables
 ENV PYTHONUNBUFFERED=1
 ENV PYTHON_API_HOST=0.0.0.0
 ENV PYTHON_API_PORT=5000
 
-# Use entrypoint script to check SECRET_KEY before starting
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
-
-# Start command
-CMD ["python", "run.py"]
+CMD ["gunicorn", "-c", "gunicorn_config.py", "run:app"]

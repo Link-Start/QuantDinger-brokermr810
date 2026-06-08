@@ -25,8 +25,39 @@ except ImportError:
     logger.warning("bcrypt not installed. Using SHA256 for password hashing (less secure).")
 
 
+_DEFAULT_WATCHLIST = [
+    ("Crypto", "BTC/USDT", "Bitcoin"),
+    ("Crypto", "ETH/USDT", "Ethereum"),
+    ("Crypto", "SOL/USDT", "Solana"),
+    ("USStock", "AAPL", "Apple"),
+    ("USStock", "NVDA", "NVIDIA"),
+    ("USStock", "TSLA", "Tesla"),
+    ("USStock", "MSFT", "Microsoft"),
+]
+
+
+def _seed_default_watchlist(db, user_id: int):
+    """Insert a starter watchlist for brand-new users (FTUE)."""
+    cur = db.cursor()
+    for market, symbol, name in _DEFAULT_WATCHLIST:
+        cur.execute(
+            """
+            INSERT INTO qd_watchlist (user_id, market, symbol, name, created_at, updated_at)
+            VALUES (?, ?, ?, ?, NOW(), NOW())
+            ON CONFLICT (user_id, market, symbol) DO NOTHING
+            """,
+            (user_id, market, symbol, name),
+        )
+    db.commit()
+    cur.close()
+    logger.info(f"Seeded {len(_DEFAULT_WATCHLIST)} default watchlist items for user {user_id}")
+
+
 class UserService:
     """User management service"""
+
+    _password_changed_column_ready = False
+    BOOTSTRAP_DEFAULT_PASSWORD = '123456'
     
     # Available roles (ordered by privilege level)
     ROLES = ['viewer', 'user', 'manager', 'admin']
@@ -39,6 +70,226 @@ class UserService:
         'admin': ['dashboard', 'view', 'indicator', 'backtest', 'strategy', 'portfolio', 'settings', 'user_manage', 'credentials'],
     }
     
+    def ensure_password_changed_column(self) -> None:
+        """Add password_changed_at if missing (idempotent)."""
+        if UserService._password_changed_column_ready:
+            return
+        try:
+            with get_db_connection() as db:
+                cur = db.cursor()
+                cur.execute(
+                    """
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'qd_users' AND column_name = 'password_changed_at'
+                    """
+                )
+                if not cur.fetchone():
+                    cur.execute(
+                        "ALTER TABLE qd_users ADD COLUMN password_changed_at TIMESTAMP NULL"
+                    )
+                    # Existing accounts: assume they already passed initial setup.
+                    cur.execute(
+                        """
+                        UPDATE qd_users
+                        SET password_changed_at = COALESCE(updated_at, created_at, NOW())
+                        WHERE password_changed_at IS NULL
+                        """
+                    )
+                    db.commit()
+                    logger.info("Added password_changed_at column to qd_users (existing rows backfilled)")
+                cur.close()
+            UserService._password_changed_column_ready = True
+        except Exception as e:
+            logger.warning(f"ensure_password_changed_column failed: {e}")
+
+    def mark_password_changed(self, user_id: int) -> None:
+        """Record that the user has set a non-initial password."""
+        self.ensure_password_changed_column()
+        try:
+            with get_db_connection() as db:
+                cur = db.cursor()
+                cur.execute(
+                    """
+                    UPDATE qd_users
+                    SET password_changed_at = NOW(), updated_at = NOW()
+                    WHERE id = ?
+                    """,
+                    (user_id,),
+                )
+                db.commit()
+                cur.close()
+        except Exception as e:
+            logger.warning(f"mark_password_changed failed for user {user_id}: {e}")
+
+    @classmethod
+    def _configured_admin_password(cls) -> str:
+        """Return the current bootstrap admin password from env/config."""
+        try:
+            from app.config.settings import Config
+            return str(Config.ADMIN_PASSWORD or '')
+        except Exception:
+            return str(os.getenv('ADMIN_PASSWORD', '') or '')
+
+    @classmethod
+    def _is_bootstrap_default_plain_password(cls, password: str) -> bool:
+        return str(password or '') == cls.BOOTSTRAP_DEFAULT_PASSWORD
+
+    @classmethod
+    def _configured_admin_password_is_default(cls) -> bool:
+        return cls._is_bootstrap_default_plain_password(cls._configured_admin_password())
+
+    def _password_hash_matches_bootstrap_default(self, password_hash: str) -> bool:
+        password_hash = str(password_hash or '').strip()
+        if not password_hash:
+            return False
+        return self.verify_password(self.BOOTSTRAP_DEFAULT_PASSWORD, password_hash)
+
+    def _initial_password_state(self, password_hash: str, password_changed_at: Any) -> str:
+        """
+        Classify bootstrap password state for the first user.
+
+        Returns:
+            ok: no reminder/action needed
+            must_change: still using the unsafe built-in default password
+            sync_env_password: env ADMIN_PASSWORD is non-default but DB still has 123456
+            mark_changed: DB password is non-default, but password_changed_at was never set
+        """
+        if password_changed_at is not None:
+            return 'ok'
+        if not str(password_hash or '').strip():
+            return 'ok'
+        if self._password_hash_matches_bootstrap_default(password_hash):
+            if self._configured_admin_password_is_default():
+                return 'must_change'
+            return 'sync_env_password'
+        return 'mark_changed'
+
+    def _sync_bootstrap_admin_password_from_env(self, user_id: int, password_hash: str) -> bool:
+        """
+        If operators changed ADMIN_PASSWORD in .env after DB bootstrap, migrate the
+        first user's DB password away from the hard-coded default.
+        """
+        env_password = self._configured_admin_password()
+        if self._is_bootstrap_default_plain_password(env_password):
+            return False
+        if not env_password:
+            return False
+        if not self._password_hash_matches_bootstrap_default(password_hash):
+            return False
+
+        try:
+            new_hash = self.hash_password(env_password)
+            with get_db_connection() as db:
+                cur = db.cursor()
+                cur.execute(
+                    """
+                    UPDATE qd_users
+                    SET password_hash = ?, password_changed_at = NOW(), updated_at = NOW()
+                    WHERE id = ?
+                    """,
+                    (new_hash, user_id),
+                )
+                db.commit()
+                cur.close()
+            logger.info("Synchronized bootstrap admin password from non-default ADMIN_PASSWORD")
+            return True
+        except Exception as e:
+            logger.warning(f"sync bootstrap admin password failed for user {user_id}: {e}")
+            return False
+
+    def sync_bootstrap_admin_password_from_env(self) -> bool:
+        """Repair bootstrap admin password if env was changed after DB creation."""
+        first_id = self.get_first_user_id()
+        if first_id is None:
+            return False
+        if self._configured_admin_password_is_default():
+            return False
+
+        self.ensure_password_changed_column()
+        try:
+            with get_db_connection() as db:
+                cur = db.cursor()
+                cur.execute(
+                    """
+                    SELECT password_hash, password_changed_at
+                    FROM qd_users WHERE id = ?
+                    """,
+                    (first_id,),
+                )
+                row = cur.fetchone()
+                cur.close()
+            if not row:
+                return False
+            state = self._initial_password_state(
+                row.get('password_hash'),
+                row.get('password_changed_at'),
+            )
+            if state != 'sync_env_password':
+                return False
+            return self._sync_bootstrap_admin_password_from_env(
+                int(first_id),
+                str(row.get('password_hash') or ''),
+            )
+        except Exception as e:
+            logger.warning(f"sync_bootstrap_admin_password_from_env failed: {e}")
+            return False
+
+    def get_first_user_id(self) -> Optional[int]:
+        """Return the lowest user id (bootstrap / first account created on install)."""
+        try:
+            with get_db_connection() as db:
+                cur = db.cursor()
+                cur.execute("SELECT MIN(id) AS id FROM qd_users")
+                row = cur.fetchone()
+                cur.close()
+            if not row or row.get('id') is None:
+                return None
+            return int(row['id'])
+        except Exception as e:
+            logger.warning(f"get_first_user_id failed: {e}")
+            return None
+
+    def must_change_initial_password(self, user_id: int) -> bool:
+        """
+        True only for the first user when they still use the unsafe built-in
+        bootstrap password (123456). Operators may set ADMIN_PASSWORD in .env;
+        if they do, a NULL password_changed_at alone must not force a prompt.
+        """
+        first_id = self.get_first_user_id()
+        if first_id is None or int(user_id) != first_id:
+            return False
+
+        self.ensure_password_changed_column()
+        try:
+            with get_db_connection() as db:
+                cur = db.cursor()
+                cur.execute(
+                    """
+                    SELECT password_hash, password_changed_at
+                    FROM qd_users WHERE id = ?
+                    """,
+                    (user_id,),
+                )
+                row = cur.fetchone()
+                cur.close()
+            if not row:
+                return False
+            password_hash = str(row.get('password_hash') or '').strip()
+            if not password_hash:
+                return False
+            state = self._initial_password_state(password_hash, row.get('password_changed_at'))
+            if state == 'must_change':
+                return True
+            if state == 'sync_env_password':
+                self._sync_bootstrap_admin_password_from_env(int(user_id), password_hash)
+                return False
+            if state == 'mark_changed':
+                self.mark_password_changed(int(user_id))
+            return False
+        except Exception as e:
+            logger.warning(f"must_change_initial_password failed for user {user_id}: {e}")
+            return False
+
     def hash_password(self, password: str) -> str:
         """Hash password using bcrypt (preferred) or SHA256 (fallback)"""
         if HAS_BCRYPT:
@@ -79,7 +330,37 @@ class UserService:
                 cur.execute(
                     """
                     SELECT id, username, email, nickname, avatar, status, role,
-                           credits, vip_expires_at, timezone, last_login_at, created_at, updated_at
+                           credits, vip_expires_at, timezone,
+                           COALESCE(
+                               qd_users.last_login_at,
+                               (
+                                   SELECT MAX(sl.created_at)
+                                   FROM qd_security_logs sl
+                                   WHERE sl.user_id = qd_users.id
+                                     AND sl.action IN ('login_success', 'login_via_code', 'oauth_login')
+                               )
+                           ) AS last_login_at,
+                           COALESCE(
+                               (
+                                   SELECT sl.ip_address
+                                   FROM qd_security_logs sl
+                                   WHERE sl.user_id = qd_users.id
+                                     AND sl.action IN ('register', 'register_via_code')
+                                     AND COALESCE(sl.ip_address, '') <> ''
+                                   ORDER BY sl.created_at ASC
+                                   LIMIT 1
+                               ),
+                               (
+                                   SELECT sl.ip_address
+                                   FROM qd_security_logs sl
+                                   WHERE sl.user_id = qd_users.id
+                                     AND sl.action IN ('oauth_login', 'login_success', 'login_via_code')
+                                     AND COALESCE(sl.ip_address, '') <> ''
+                                   ORDER BY sl.created_at ASC
+                                   LIMIT 1
+                               )
+                           ) AS register_ip,
+                           created_at, updated_at
                     FROM qd_users WHERE id = ?
                     """,
                     (user_id,)
@@ -247,7 +528,7 @@ class UserService:
                 cur.close()
                 
                 new_version = int(row.get('token_version') or 1) if row else 1
-                logger.info(f"Incremented token_version for user_id={user_id} to {new_version}")
+                logger.info("Incremented token_version for user")
                 return new_version
         except Exception as e:
             logger.error(f"increment_token_version failed: {e}")
@@ -331,6 +612,22 @@ class UserService:
                     cur.close()
                 
                 logger.info(f"Created user: {username} (id={user_id}, referred_by={referred_by})")
+
+                # Seed default watchlist + builtin indicator samples for new users (FTUE)
+                if user_id:
+                    if password and not self._is_bootstrap_default_plain_password(password):
+                        self.mark_password_changed(int(user_id))
+                    try:
+                        _seed_default_watchlist(db, user_id)
+                    except Exception as seed_err:
+                        logger.warning(f"Default watchlist seed failed for user {user_id}: {seed_err}")
+                    try:
+                        from app.services.builtin_indicators import seed_builtin_indicators_for_new_user
+
+                        seed_builtin_indicators_for_new_user(db, user_id)
+                    except Exception as ind_err:
+                        logger.warning(f"Builtin indicators seed failed for user {user_id}: {ind_err}")
+
                 return user_id
         except Exception as e:
             logger.error(f"create_user failed: {e}")
@@ -418,11 +715,16 @@ class UserService:
         password_hash = self.hash_password(new_password)
         
         try:
+            self.ensure_password_changed_column()
             with get_db_connection() as db:
                 cur = db.cursor()
                 cur.execute(
-                    "UPDATE qd_users SET password_hash = ?, updated_at = NOW() WHERE id = ?",
-                    (password_hash, user_id)
+                    """
+                    UPDATE qd_users
+                    SET password_hash = ?, password_changed_at = NOW(), updated_at = NOW()
+                    WHERE id = ?
+                    """,
+                    (password_hash, user_id),
                 )
                 db.commit()
                 cur.close()
@@ -448,7 +750,43 @@ class UserService:
             logger.error(f"delete_user failed: {e}")
             return False
     
-    def list_users(self, page: int = 1, page_size: int = 20, search: str = None) -> Dict[str, Any]:
+    @staticmethod
+    def _build_user_list_filter(search: str = None, user_id: int = None) -> tuple:
+        """WHERE clause + params for admin user list (supports exact user id)."""
+        clauses = []
+        params = []
+        if user_id is not None:
+            try:
+                uid = int(user_id)
+            except (TypeError, ValueError):
+                uid = 0
+            if uid > 0:
+                clauses.append("id = ?")
+                params.append(uid)
+        if search and str(search).strip():
+            raw = str(search).strip()
+            like_val = f"%{raw}%"
+            parts = ["username ILIKE ?", "email ILIKE ?", "nickname ILIKE ?"]
+            part_params = [like_val, like_val, like_val]
+            if raw.isdigit():
+                parts.extend(["id = ?", "CAST(id AS TEXT) ILIKE ?"])
+                part_params.extend([int(raw), f"%{raw}%"])
+            else:
+                parts.append("CAST(id AS TEXT) ILIKE ?")
+                part_params.append(f"%{raw}%")
+            clauses.append("(" + " OR ".join(parts) + ")")
+            params.extend(part_params)
+        if not clauses:
+            return "", []
+        return "WHERE " + " AND ".join(clauses), params
+
+    def list_users(
+        self,
+        page: int = 1,
+        page_size: int = 20,
+        search: str = None,
+        user_id: int = None,
+    ) -> Dict[str, Any]:
         """List all users with pagination and optional search"""
         offset = (page - 1) * page_size
         
@@ -456,13 +794,7 @@ class UserService:
             with get_db_connection() as db:
                 cur = db.cursor()
                 
-                # Build WHERE clause for search
-                where_clause = ""
-                params = []
-                if search and search.strip():
-                    search_term = f"%{search.strip()}%"
-                    where_clause = "WHERE username LIKE ? OR email LIKE ? OR nickname LIKE ?"
-                    params = [search_term, search_term, search_term]
+                where_clause, params = self._build_user_list_filter(search, user_id)
                 
                 # Get total count
                 count_sql = f"SELECT COUNT(*) as count FROM qd_users {where_clause}"
@@ -472,7 +804,37 @@ class UserService:
                 # Get users
                 query_sql = f"""
                     SELECT id, username, email, nickname, avatar, status, role,
-                           credits, vip_expires_at, timezone, last_login_at, created_at, updated_at
+                           credits, vip_expires_at, timezone,
+                           COALESCE(
+                               qd_users.last_login_at,
+                               (
+                                   SELECT MAX(sl.created_at)
+                                   FROM qd_security_logs sl
+                                   WHERE sl.user_id = qd_users.id
+                                     AND sl.action IN ('login_success', 'login_via_code', 'oauth_login')
+                               )
+                           ) AS last_login_at,
+                           COALESCE(
+                               (
+                                   SELECT sl.ip_address
+                                   FROM qd_security_logs sl
+                                   WHERE sl.user_id = qd_users.id
+                                     AND sl.action IN ('register', 'register_via_code')
+                                     AND COALESCE(sl.ip_address, '') <> ''
+                                   ORDER BY sl.created_at ASC
+                                   LIMIT 1
+                               ),
+                               (
+                                   SELECT sl.ip_address
+                                   FROM qd_security_logs sl
+                                   WHERE sl.user_id = qd_users.id
+                                     AND sl.action IN ('oauth_login', 'login_success', 'login_via_code')
+                                     AND COALESCE(sl.ip_address, '') <> ''
+                                   ORDER BY sl.created_at ASC
+                                   LIMIT 1
+                               )
+                           ) AS register_ip,
+                           created_at, updated_at
                     FROM qd_users
                     {where_clause}
                     ORDER BY id DESC
@@ -492,6 +854,59 @@ class UserService:
         except Exception as e:
             logger.error(f"list_users failed: {e}")
             return {'items': [], 'total': 0, 'page': 1, 'page_size': page_size, 'total_pages': 0}
+
+    def list_all_users_for_export(self, search: str = None, user_id: int = None) -> List[Dict[str, Any]]:
+        """List all users for export with the same fields as the admin user table."""
+        try:
+            with get_db_connection() as db:
+                cur = db.cursor()
+
+                where_clause, params = self._build_user_list_filter(search, user_id)
+
+                query_sql = f"""
+                    SELECT id, username, email, nickname, avatar, status, role,
+                           credits, vip_expires_at, timezone,
+                           COALESCE(
+                               qd_users.last_login_at,
+                               (
+                                   SELECT MAX(sl.created_at)
+                                   FROM qd_security_logs sl
+                                   WHERE sl.user_id = qd_users.id
+                                     AND sl.action IN ('login_success', 'login_via_code', 'oauth_login')
+                               )
+                           ) AS last_login_at,
+                           COALESCE(
+                               (
+                                   SELECT sl.ip_address
+                                   FROM qd_security_logs sl
+                                   WHERE sl.user_id = qd_users.id
+                                     AND sl.action IN ('register', 'register_via_code')
+                                     AND COALESCE(sl.ip_address, '') <> ''
+                                   ORDER BY sl.created_at ASC
+                                   LIMIT 1
+                               ),
+                               (
+                                   SELECT sl.ip_address
+                                   FROM qd_security_logs sl
+                                   WHERE sl.user_id = qd_users.id
+                                     AND sl.action IN ('oauth_login', 'login_success', 'login_via_code')
+                                     AND COALESCE(sl.ip_address, '') <> ''
+                                   ORDER BY sl.created_at ASC
+                                   LIMIT 1
+                               )
+                           ) AS register_ip,
+                           created_at, updated_at
+                    FROM qd_users
+                    {where_clause}
+                    ORDER BY id DESC
+                """
+                cur.execute(query_sql, tuple(params))
+                users = cur.fetchall() or []
+                cur.close()
+                return users
+        except Exception as e:
+            logger.error(f"list_all_users_for_export failed: {e}")
+            return []
     
     def get_user_permissions(self, role: str) -> List[str]:
         """Get permissions for a role"""
@@ -502,6 +917,7 @@ class UserService:
         Ensure at least one admin user exists.
         Creates admin using ADMIN_USER/ADMIN_PASSWORD from env if no users exist.
         """
+        self.ensure_password_changed_column()
         try:
             with get_db_connection() as db:
                 cur = db.cursor()
@@ -511,8 +927,9 @@ class UserService:
                 
                 if count == 0:
                     # Create admin using env credentials
-                    admin_user = os.getenv('ADMIN_USER', 'admin')
-                    admin_password = os.getenv('ADMIN_PASSWORD', 'admin123')
+                    from app.config.settings import Config
+                    admin_user = os.getenv('ADMIN_USER', Config.ADMIN_USER)
+                    admin_password = os.getenv('ADMIN_PASSWORD', Config.ADMIN_PASSWORD)
                     admin_email = os.getenv('ADMIN_EMAIL', 'admin@example.com')
 
                     self.create_user({
@@ -525,6 +942,8 @@ class UserService:
                         'email_verified': True  # Admin email is pre-verified
                     })
                     logger.info(f"Created admin user: {admin_user} ({admin_email})")
+                else:
+                    self.sync_bootstrap_admin_password_from_env()
         except Exception as e:
             logger.error(f"ensure_admin_exists failed: {e}")
 

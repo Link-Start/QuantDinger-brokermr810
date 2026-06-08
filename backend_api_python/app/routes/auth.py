@@ -5,36 +5,87 @@ Handles login, logout, registration, password reset, and OAuth authentication.
 Supports both multi-user (database) and single-user (legacy) modes.
 """
 import os
-from flask import Blueprint, request, jsonify, g, redirect
-from urllib.parse import urlencode
+from flask import g, jsonify, redirect, request
+from app.openapi.blueprint import HumanBlueprint as Blueprint
+from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
 from app.config.settings import Config
 from app.utils.auth import generate_token, login_required, authenticate_legacy
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-auth_bp = Blueprint('auth', __name__)
+auth_blp = Blueprint('auth', __name__)
 
 def _build_frontend_login_redirect(frontend_url: str, **params) -> str:
     """
-    Build a redirect URL to frontend login page for OAuth flows.
+    Build a redirect URL to the frontend login page for OAuth flows.
 
-    Frontend uses Vue Router hash mode (`/#/user/login`), so redirecting to `/user/login`
-    will 404 on static hosting. Always normalize to `{origin}/#/user/login`.
+    Supports both:
+    - PC (hash mode, path `/#/user/login`) — default behavior when only an origin
+      is supplied via FRONTEND_URL.
+    - Mobile / SPA history mode (e.g. `https://m.example.com/login`) — when the
+      caller provides a full URL with a real path (and optional query/hash), we
+      preserve that path instead of overwriting it with `/#/user/login`.
+
+    The decision rule:
+    1. If `frontend_url` contains a hash fragment (starts with `#/`), treat it as
+       a PC hash-mode URL and normalize to `{origin}/#/user/login`.
+    2. If `frontend_url` has a path other than `/` or empty, preserve the full
+       URL (origin + path) and just append the OAuth params as query string.
+    3. Otherwise (origin only), fall back to PC `/#/user/login`.
     """
     base = (frontend_url or '').strip().rstrip('/')
     if not base:
         base = 'http://localhost:8080'
 
-    if '/#/' in base:
-        origin = base.split('/#/', 1)[0].rstrip('/')
-    elif '#' in base:
-        origin = base.split('#', 1)[0].rstrip('/')
+    # Ensure we can parse the URL
+    candidate = base if '://' in base else f'https://{base}'
+    try:
+        parsed = urlparse(candidate)
+    except Exception:
+        parsed = None
+
+    origin = ''
+    has_real_path = False
+    has_hash_route = False
+
+    if parsed and parsed.scheme and parsed.netloc:
+        origin = f"{parsed.scheme}://{parsed.netloc}".rstrip('/')
+        # Hash-mode PC login URL, e.g. https://pc.example.com/#/user/login
+        if parsed.fragment:
+            has_hash_route = True
+        path_part = (parsed.path or '').rstrip('/')
+        if path_part and path_part != '':
+            has_real_path = True
     else:
         origin = base
 
+    clean_params = {k: v for k, v in params.items() if v is not None and v != ''}
+    qs = urlencode(clean_params)
+
+    if has_hash_route:
+        # PC / hash-mode: always normalize to /#/user/login
+        login_url = f"{origin}/#/user/login"
+        return f"{login_url}?{qs}" if qs else login_url
+
+    if has_real_path:
+        # SPA history-mode (mobile etc.) — keep the caller-provided path and
+        # merge OAuth params into existing query string.
+        existing_qs = dict(parse_qsl(parsed.query or '', keep_blank_values=True))
+        existing_qs.update(clean_params)
+        merged_qs = urlencode(existing_qs)
+        rebuilt = urlunparse((
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            merged_qs,
+            ''  # drop the fragment deliberately for history-mode SPAs
+        ))
+        return rebuilt
+
+    # Origin only — fall back to PC hash route for backward compatibility
     login_url = f"{origin}/#/user/login"
-    qs = urlencode({k: v for k, v in params.items() if v is not None and v != ''})
     return f"{login_url}?{qs}" if qs else login_url
 
 
@@ -58,11 +109,20 @@ def _get_user_agent() -> str:
     return request.headers.get('User-Agent', '')[:500]
 
 
+def _userinfo_must_change_initial_password(user_id: int) -> bool:
+    """Whether the UI should prompt the user to change their bootstrap password."""
+    try:
+        from app.services.user_service import get_user_service
+        return get_user_service().must_change_initial_password(int(user_id))
+    except Exception:
+        return False
+
+
 # =============================================================================
 # Security Config Endpoint
 # =============================================================================
 
-@auth_bp.route('/security-config', methods=['GET'])
+@auth_blp.route('/security-config', methods=['GET'])
 def get_security_config():
     """
     Get public security configuration for frontend.
@@ -87,7 +147,7 @@ def get_security_config():
 # Login Endpoint (Enhanced with security)
 # =============================================================================
 
-@auth_bp.route('/login', methods=['POST'])
+@auth_blp.route('/login', methods=['POST'])
 def login():
     """
     User login endpoint.
@@ -199,8 +259,15 @@ def login():
         security.record_login_attempt(username, 'account', True, ip_address, user_agent)
         security.clear_login_attempts(ip_address, 'ip')
         security.clear_login_attempts(username, 'account')
-        security.log_security_event('login_success', user.get('id'), ip_address, user_agent)
-        
+        from app.services.login_notify import notify_successful_login
+        notify_successful_login(
+            user_id=int(user.get('id') or user_id),
+            action='login_success',
+            ip_address=ip_address,
+            user_agent=user_agent,
+            extra_details={'method': 'password'},
+        )
+
         # Build user info for frontend
         userinfo = {
             'id': user.get('id') or user.get('user_id', 1),
@@ -211,7 +278,8 @@ def login():
             'role': {
                 'id': user.get('role', 'admin'),
                 'permissions': _get_permissions(user.get('role', 'admin'))
-            }
+            },
+            'must_change_initial_password': _userinfo_must_change_initial_password(user_id),
         }
         
         return jsonify({
@@ -232,7 +300,7 @@ def login():
 # Email Code Login
 # =============================================================================
 
-@auth_bp.route('/login-code', methods=['POST'])
+@auth_blp.route('/login-code', methods=['POST'])
 def login_with_code():
     """
     Login with email verification code (quick login / register).
@@ -405,9 +473,15 @@ def login_with_code():
         except Exception as e:
             logger.error(f"Failed to update last_login_at for user_id={user.get('id')}: {e}")
         
-        # Log login
-        security.log_security_event('login_via_code', user['id'], ip_address, user_agent)
-        
+        from app.services.login_notify import notify_successful_login
+        notify_successful_login(
+            user_id=int(user['id']),
+            action='login_via_code',
+            ip_address=ip_address,
+            user_agent=user_agent,
+            extra_details={'method': 'email_code', 'is_new_user': bool(is_new_user)},
+        )
+
         return jsonify({
             'code': 1,
             'msg': 'Login successful' + (' (new account created)' if is_new_user else ''),
@@ -438,7 +512,7 @@ def login_with_code():
 # Registration Endpoints
 # =============================================================================
 
-@auth_bp.route('/send-code', methods=['POST'])
+@auth_blp.route('/send-code', methods=['POST'])
 def send_verification_code():
     """
     Send verification code to email.
@@ -528,7 +602,7 @@ def send_verification_code():
         return jsonify({'code': 0, 'msg': 'Failed to send verification code', 'data': None}), 500
 
 
-@auth_bp.route('/register', methods=['POST'])
+@auth_blp.route('/register', methods=['POST'])
 def register():
     """
     Register new user with email verification.
@@ -675,6 +749,25 @@ def register():
             role='user',
             token_version=new_token_version
         )
+
+        # Update last login time (auto-login after registration)
+        try:
+            from app.utils.db import get_db_connection
+            with get_db_connection() as db:
+                cur = db.cursor()
+                cur.execute(
+                    "UPDATE qd_users SET last_login_at = NOW() WHERE id = ?",
+                    (user_id,)
+                )
+                db.commit()
+                affected = cur.rowcount
+                cur.close()
+                if affected == 0:
+                    logger.error(f"Failed to update last_login_at: no rows affected for user_id={user_id}")
+                else:
+                    logger.info(f"Updated last_login_at for user_id={user_id}")
+        except Exception as e:
+            logger.error(f"Failed to update last_login_at for user_id={user_id}: {e}")
         
         return jsonify({
             'code': 1,
@@ -701,7 +794,7 @@ def register():
         return jsonify({'code': 0, 'msg': 'Registration failed', 'data': None}), 500
 
 
-@auth_bp.route('/reset-password', methods=['POST'])
+@auth_blp.route('/reset-password', methods=['POST'])
 def reset_password():
     """
     Reset password with email verification.
@@ -775,7 +868,7 @@ def reset_password():
         return jsonify({'code': 0, 'msg': 'Password reset failed', 'data': None}), 500
 
 
-@auth_bp.route('/change-password', methods=['POST'])
+@auth_blp.route('/change-password', methods=['POST'])
 @login_required
 def change_password():
     """
@@ -842,25 +935,32 @@ def change_password():
 # OAuth Endpoints
 # =============================================================================
 
-@auth_bp.route('/oauth/google', methods=['GET'])
+@auth_blp.route('/oauth/google', methods=['GET'])
 def oauth_google():
-    """Redirect to Google OAuth authorization page"""
+    """Redirect to Google OAuth authorization page.
+
+    Query params:
+        redirect: optional front-end URL (must be allow-listed). When provided,
+                  after successful login the user is redirected there instead of
+                  the default FRONTEND_URL. Supports multi-frontend (PC + mobile).
+    """
     try:
         from app.services.oauth_service import get_oauth_service
         oauth = get_oauth_service()
-        
+
         if not oauth.google_enabled:
             return jsonify({'code': 0, 'msg': 'Google OAuth is not configured', 'data': None}), 400
-        
-        auth_url, state = oauth.get_google_auth_url()
+
+        redirect_url = (request.args.get('redirect') or '').strip()
+        auth_url, state = oauth.get_google_auth_url(redirect_url=redirect_url)
         return redirect(auth_url)
-        
+
     except Exception as e:
         logger.error(f"oauth_google error: {e}")
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
-@auth_bp.route('/oauth/google/callback', methods=['GET'])
+@auth_blp.route('/oauth/google/callback', methods=['GET'])
 def oauth_google_callback():
     """Handle Google OAuth callback"""
     ip_address = _get_client_ip()
@@ -876,15 +976,18 @@ def oauth_google_callback():
         code = request.args.get('code')
         state = request.args.get('state')
         error = request.args.get('error')
-        
-        frontend_url = oauth.frontend_url
-        
+
+        # Peek the per-state redirect (set when the flow was initiated) before
+        # handle_* consumes the state; fall back to default FRONTEND_URL.
+        state_redirect = oauth.peek_state_redirect(state) if state else ''
+        frontend_url = state_redirect or oauth.frontend_url
+
         if error:
             return redirect(_build_frontend_login_redirect(frontend_url, oauth_error=error))
-        
+
         if not code or not state:
             return redirect(_build_frontend_login_redirect(frontend_url, oauth_error='missing_params'))
-        
+
         # Handle callback
         success, result = oauth.handle_google_callback(code, state)
         if not success:
@@ -914,10 +1017,15 @@ def oauth_google_callback():
             token_version=new_token_version
         )
         
-        # Log OAuth login
-        security.log_security_event('oauth_login', user_result['id'], ip_address, user_agent,
-                                   {'provider': 'google'})
-        
+        from app.services.login_notify import notify_successful_login
+        notify_successful_login(
+            user_id=int(user_result['id']),
+            action='oauth_login',
+            ip_address=ip_address,
+            user_agent=user_agent,
+            extra_details={'provider': 'google', 'method': 'oauth'},
+        )
+
         # Redirect to frontend with token
         return redirect(_build_frontend_login_redirect(frontend_url, oauth_token=token))
         
@@ -928,25 +1036,30 @@ def oauth_google_callback():
         return redirect(_build_frontend_login_redirect(frontend_url, oauth_error='server_error'))
 
 
-@auth_bp.route('/oauth/github', methods=['GET'])
+@auth_blp.route('/oauth/github', methods=['GET'])
 def oauth_github():
-    """Redirect to GitHub OAuth authorization page"""
+    """Redirect to GitHub OAuth authorization page.
+
+    Query params:
+        redirect: optional front-end URL (must be allow-listed), see oauth_google.
+    """
     try:
         from app.services.oauth_service import get_oauth_service
         oauth = get_oauth_service()
-        
+
         if not oauth.github_enabled:
             return jsonify({'code': 0, 'msg': 'GitHub OAuth is not configured', 'data': None}), 400
-        
-        auth_url, state = oauth.get_github_auth_url()
+
+        redirect_url = (request.args.get('redirect') or '').strip()
+        auth_url, state = oauth.get_github_auth_url(redirect_url=redirect_url)
         return redirect(auth_url)
-        
+
     except Exception as e:
         logger.error(f"oauth_github error: {e}")
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
-@auth_bp.route('/oauth/github/callback', methods=['GET'])
+@auth_blp.route('/oauth/github/callback', methods=['GET'])
 def oauth_github_callback():
     """Handle GitHub OAuth callback"""
     ip_address = _get_client_ip()
@@ -962,15 +1075,16 @@ def oauth_github_callback():
         code = request.args.get('code')
         state = request.args.get('state')
         error = request.args.get('error')
-        
-        frontend_url = oauth.frontend_url
-        
+
+        state_redirect = oauth.peek_state_redirect(state) if state else ''
+        frontend_url = state_redirect or oauth.frontend_url
+
         if error:
             return redirect(_build_frontend_login_redirect(frontend_url, oauth_error=error))
-        
+
         if not code or not state:
             return redirect(_build_frontend_login_redirect(frontend_url, oauth_error='missing_params'))
-        
+
         # Handle callback
         success, result = oauth.handle_github_callback(code, state)
         if not success:
@@ -1000,10 +1114,15 @@ def oauth_github_callback():
             token_version=new_token_version
         )
         
-        # Log OAuth login
-        security.log_security_event('oauth_login', user_result['id'], ip_address, user_agent,
-                                   {'provider': 'github'})
-        
+        from app.services.login_notify import notify_successful_login
+        notify_successful_login(
+            user_id=int(user_result['id']),
+            action='oauth_login',
+            ip_address=ip_address,
+            user_agent=user_agent,
+            extra_details={'provider': 'github', 'method': 'oauth'},
+        )
+
         # Redirect to frontend with token
         return redirect(_build_frontend_login_redirect(frontend_url, oauth_token=token))
         
@@ -1018,13 +1137,13 @@ def oauth_github_callback():
 # Other Endpoints
 # =============================================================================
 
-@auth_bp.route('/logout', methods=['POST'])
+@auth_blp.route('/logout', methods=['POST'])
 def logout():
     """Logout (client removes token; server is stateless)."""
     return jsonify({'code': 1, 'msg': 'Logout successful', 'data': None})
 
 
-@auth_bp.route('/info', methods=['GET'])
+@auth_blp.route('/info', methods=['GET'])
 @login_required
 def get_user_info():
     """Get current user info."""
@@ -1043,11 +1162,12 @@ def get_user_info():
                 logger.warning(f"Failed to get user from database: {e}")
         
         if user_data:
+            uid = user_data.get('id')
             return jsonify({
                 'code': 1,
                 'msg': 'Success',
                 'data': {
-                    'id': user_data.get('id'),
+                    'id': uid,
                     'username': user_data.get('username'),
                     'nickname': user_data.get('nickname', 'User'),
                     'email': user_data.get('email'),
@@ -1056,7 +1176,8 @@ def get_user_info():
                     'role': {
                         'id': user_data.get('role', 'user'),
                         'permissions': _get_permissions(user_data.get('role', 'user'))
-                    }
+                    },
+                    'must_change_initial_password': _userinfo_must_change_initial_password(uid),
                 }
             })
         
@@ -1092,3 +1213,6 @@ def _get_permissions(role: str) -> list:
             return ['dashboard', 'view', 'indicator', 'backtest', 'strategy', 
                     'portfolio', 'settings', 'user_manage', 'credentials']
         return ['dashboard', 'view', 'indicator', 'backtest', 'strategy', 'portfolio']
+
+# openapi-compat: legacy import name
+auth_bp = auth_blp

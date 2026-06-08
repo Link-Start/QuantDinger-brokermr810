@@ -100,7 +100,9 @@ If you plan a large change, please open a discussion first.
 This repository contains:
 
 - `backend_api_python/`: Flask backend + strategy runtime
-- `quantdinger_vue/`: Vue frontend
+- `docker-compose.yml` / `docker-compose.ghcr.yml`: deployment stacks
+
+The web UI source lives in the separate private **QuantDinger-Vue** repo, which publishes `ghcr.io/brokermr810/quantdinger-frontend` to GHCR on every `v*` tag — both Compose files pull that image directly.
 
 ### Backend (Python)
 
@@ -111,13 +113,11 @@ cp env.example .env   # Windows: copy env.example .env
 python run.py
 ```
 
-### Frontend (Vue)
+### Frontend
 
-```bash
-cd quantdinger_vue
-npm install
-npm run serve
-```
+The SPA lives in the private **QuantDinger-Vue** repo. Tagging a release there (`git tag vX.Y.Z && git push --tags`) triggers `.github/workflows/release-frontend.yml`, which builds a multi-arch image and pushes it to `ghcr.io/brokermr810/quantdinger-frontend`. No frontend artefacts are committed here — pin the consumed tag via `IMAGE_TAG` (or `FRONTEND_TAG` for a per-side override) in a root-level `.env`.
+
+For local iteration without publishing, clone the Vue repo into `./QuantDinger-Vue/` (gitignored) and run `docker compose -f docker-compose.yml -f docker-compose.build.yml up --build` — see **DEVELOPMENT.md → Building frontend from local source**.
 
 ---
 
@@ -151,6 +151,27 @@ We do not enforce a single test command yet. Please at least:
 - **Frontend**: run the dev server and verify affected pages/components
 
 Bug fixes should include a minimal regression test when practical.
+
+---
+
+## API documentation
+
+QuantDinger uses **OpenAPI 3** as the HTTP contract SSOT.
+
+| Surface | Spec | When to update |
+|---------|------|----------------|
+| Human Web API | [`docs/api/openapi.yaml`](docs/api/openapi.yaml) | Any flask-smorest route in `app/openapi/` |
+| Agent Gateway | [`docs/agent/agent-openapi.json`](docs/agent/agent-openapi.json) | Any `/api/agent/v1` route |
+
+**Regenerate human spec:**
+
+```bash
+cd backend_api_python
+python scripts/export_openapi.py
+```
+
+Read [`docs/API_CONVENTIONS.md`](docs/API_CONVENTIONS.md) before adding Public endpoints.
+CI (`.github/workflows/openapi-ci.yml`) runs Spectral lint, export diff, and oasdiff breaking checks.
 
 ---
 

@@ -2,8 +2,10 @@
 Portfolio API routes (local-only).
 Manages manual positions (user's existing holdings) and AI monitoring tasks.
 """
-from flask import Blueprint, request, jsonify, g
+from flask import g, jsonify, request
+from app.openapi.blueprint import HumanBlueprint as Blueprint
 from datetime import date, datetime, timezone
+import os
 import json
 import traceback
 import time
@@ -15,18 +17,27 @@ from app.utils.logger import get_logger
 from app.utils.cache import CacheManager
 from app.utils.db import get_db_connection
 from app.utils.auth import login_required
-from app.services.symbol_name import resolve_symbol_name
+from app.services.symbol_name import resolve_symbol_name, normalize_crypto_symbol
 from app.data.market_symbols_seed import get_symbol_name as seed_get_symbol_name
 
 logger = get_logger(__name__)
 
-portfolio_bp = Blueprint('portfolio', __name__)
+portfolio_blp = Blueprint('portfolio', __name__)
 kline_service = KlineService()
 cache = CacheManager()
 
-# Thread pool for parallel price fetching
-# Lower concurrency to avoid triggering API limits (especially for forex/US stocks)
-executor = ThreadPoolExecutor(max_workers=3)
+# Thread pool for parallel price fetching.
+# Lower concurrency to avoid triggering API limits (especially for forex/US
+# stocks) and to keep pressure off the DB connection pool.
+# Tunable via PORTFOLIO_EXECUTOR_WORKERS env.
+def _portfolio_executor_workers() -> int:
+    try:
+        v = int(os.getenv("PORTFOLIO_EXECUTOR_WORKERS", "3"))
+        return v if v > 0 else 3
+    except Exception:
+        return 3
+
+executor = ThreadPoolExecutor(max_workers=_portfolio_executor_workers())
 
 # Request interval (seconds) to avoid too frequent requests
 REQUEST_INTERVAL = 0.3
@@ -41,21 +52,24 @@ def _now_ts() -> int:
 
 
 def _serialize_monitor_ts(value):
+    """Serialize a TIMESTAMP value for the frontend.
+
+    DB columns are ``TIMESTAMP WITHOUT TIME ZONE`` and PostgreSQL writes them
+    as wall-clock in the container's ``TZ`` (see docker-compose ``TZ`` env
+    var).  The old implementation assumed naive = UTC, which was wrong on any
+    deployment whose container TZ wasn't UTC (default is Asia/Shanghai for
+    this project) and caused an 8-hour drift on the dashboard.
+
+    Delegating to ``to_utc_iso`` keeps this consistent with the global
+    ``SafeJSONProvider`` rule: naive timestamps are interpreted in the server's
+    local time zone, then re-emitted as UTC ISO 8601 with a ``Z`` suffix.
     """
-    JSON 序列化监控时间字段。PostgreSQL TIMESTAMP 无 tz 时按 UTC 解释（与 Docker 默认一致），
-    输出带 Z 的 ISO，避免前端把无时区字符串当本地时间而偏差 8 小时。
-    """
+    from app.utils.timeutil import to_utc_iso
+
     if value is None:
         return None
     if isinstance(value, datetime):
-        if value.tzinfo is None:
-            dt = value.replace(tzinfo=timezone.utc)
-        else:
-            dt = value.astimezone(timezone.utc)
-        s = dt.isoformat()
-        if s.endswith("+00:00"):
-            return s[:-6] + "Z"
-        return s
+        return to_utc_iso(value)
     if isinstance(value, date):
         return value.isoformat()
     return value
@@ -129,7 +143,7 @@ def _get_single_price(market: str, symbol: str, force_refresh: bool = False) -> 
 
 # ==================== Position CRUD ====================
 
-@portfolio_bp.route('/positions', methods=['GET'])
+@portfolio_blp.route('/positions', methods=['GET'])
 @login_required
 def get_positions():
     """Get all manual positions with current prices for the current user."""
@@ -234,7 +248,7 @@ def get_positions():
         return jsonify({'code': 0, 'msg': str(e), 'data': []}), 500
 
 
-@portfolio_bp.route('/positions', methods=['POST'])
+@portfolio_blp.route('/positions', methods=['POST'])
 @login_required
 def add_position():
     """Add a new manual position for the current user."""
@@ -254,7 +268,14 @@ def add_position():
         
         if not market or not symbol:
             return jsonify({'code': 0, 'msg': 'Missing market or symbol', 'data': None}), 400
-        
+
+        # Canonicalise Crypto symbols (BTC -> BTC/USDT, BTCUSDT -> BTC/USDT)
+        # so positions, watchlist and strategies all dedupe on the same key.
+        # See app.services.symbol_name.normalize_crypto_symbol for the full
+        # contract.
+        if market == 'Crypto':
+            symbol = normalize_crypto_symbol(symbol)
+
         if quantity <= 0:
             return jsonify({'code': 0, 'msg': 'Quantity must be positive', 'data': None}), 400
         
@@ -297,7 +318,7 @@ def add_position():
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
-@portfolio_bp.route('/positions/<int:position_id>', methods=['PUT'])
+@portfolio_blp.route('/positions/<int:position_id>', methods=['PUT'])
 @login_required
 def update_position(position_id):
     """Update an existing position for the current user."""
@@ -366,7 +387,7 @@ def update_position(position_id):
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
-@portfolio_bp.route('/positions/<int:position_id>', methods=['DELETE'])
+@portfolio_blp.route('/positions/<int:position_id>', methods=['DELETE'])
 @login_required
 def delete_position(position_id):
     """Delete a position for the current user."""
@@ -388,7 +409,7 @@ def delete_position(position_id):
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
-@portfolio_bp.route('/summary', methods=['GET'])
+@portfolio_blp.route('/summary', methods=['GET'])
 @login_required
 def get_portfolio_summary():
     """Get portfolio summary with total value, PnL, and market distribution for the current user."""
@@ -510,7 +531,7 @@ def get_portfolio_summary():
 
 # ==================== Monitor CRUD ====================
 
-@portfolio_bp.route('/monitors', methods=['GET'])
+@portfolio_blp.route('/monitors', methods=['GET'])
 @login_required
 def get_monitors():
     """Get all position monitors for the current user."""
@@ -556,7 +577,7 @@ def get_monitors():
         return jsonify({'code': 0, 'msg': str(e), 'data': []}), 500
 
 
-@portfolio_bp.route('/monitors', methods=['POST'])
+@portfolio_blp.route('/monitors', methods=['POST'])
 @login_required
 def add_monitor():
     """Add a new position monitor for the current user."""
@@ -624,7 +645,7 @@ def add_monitor():
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
-@portfolio_bp.route('/monitors/<int:monitor_id>', methods=['PUT'])
+@portfolio_blp.route('/monitors/<int:monitor_id>', methods=['PUT'])
 @login_required
 def update_monitor(monitor_id):
     """Update an existing monitor for the current user."""
@@ -671,7 +692,9 @@ def update_monitor(monitor_id):
         
         # Add next_run_at update if interval was changed
         if next_run_interval is not None:
-            updates.append(f"next_run_at = NOW() + INTERVAL '{next_run_interval} minutes'")
+            # Bind minutes to avoid SQL string interpolation; Postgres: (N || ' minutes')::interval
+            updates.append("next_run_at = NOW() + (? || ' minutes')::interval")
+            params.append(int(next_run_interval))
         
         updates.append('updated_at = NOW()')
         params.append(monitor_id)
@@ -693,7 +716,7 @@ def update_monitor(monitor_id):
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
-@portfolio_bp.route('/monitors/<int:monitor_id>', methods=['DELETE'])
+@portfolio_blp.route('/monitors/<int:monitor_id>', methods=['DELETE'])
 @login_required
 def delete_monitor(monitor_id):
     """Delete a monitor for the current user."""
@@ -715,7 +738,7 @@ def delete_monitor(monitor_id):
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
-@portfolio_bp.route('/monitors/<int:monitor_id>/run', methods=['POST'])
+@portfolio_blp.route('/monitors/<int:monitor_id>/run', methods=['POST'])
 @login_required
 def run_monitor_now(monitor_id):
     """Manually trigger a monitor to run immediately.
@@ -780,7 +803,7 @@ def run_monitor_now(monitor_id):
 
 # ==================== Alerts CRUD ====================
 
-@portfolio_bp.route('/alerts', methods=['GET'])
+@portfolio_blp.route('/alerts', methods=['GET'])
 @login_required
 def get_alerts():
     """Get all position alerts for the current user."""
@@ -833,7 +856,7 @@ def get_alerts():
         return jsonify({'code': 0, 'msg': str(e), 'data': []}), 500
 
 
-@portfolio_bp.route('/alerts', methods=['POST'])
+@portfolio_blp.route('/alerts', methods=['POST'])
 @login_required
 def add_alert():
     """Add a new position alert for the current user."""
@@ -928,7 +951,7 @@ def add_alert():
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
-@portfolio_bp.route('/alerts/<int:alert_id>', methods=['PUT'])
+@portfolio_blp.route('/alerts/<int:alert_id>', methods=['PUT'])
 @login_required
 def update_alert(alert_id):
     """Update an existing alert for the current user."""
@@ -991,7 +1014,7 @@ def update_alert(alert_id):
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
-@portfolio_bp.route('/alerts/<int:alert_id>', methods=['DELETE'])
+@portfolio_blp.route('/alerts/<int:alert_id>', methods=['DELETE'])
 @login_required
 def delete_alert(alert_id):
     """Delete an alert for the current user."""
@@ -1015,7 +1038,7 @@ def delete_alert(alert_id):
 
 # ==================== Groups ====================
 
-@portfolio_bp.route('/groups', methods=['GET'])
+@portfolio_blp.route('/groups', methods=['GET'])
 @login_required
 def get_groups():
     """Get list of all groups with position counts for the current user."""
@@ -1067,7 +1090,7 @@ def get_groups():
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
-@portfolio_bp.route('/groups/rename', methods=['POST'])
+@portfolio_blp.route('/groups/rename', methods=['POST'])
 @login_required
 def rename_group():
     """Rename a group for the current user."""
@@ -1094,3 +1117,6 @@ def rename_group():
         logger.error(f"rename_group failed: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+# openapi-compat: legacy import name
+portfolio_bp = portfolio_blp

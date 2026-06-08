@@ -15,7 +15,8 @@ import json
 import time
 from typing import Any, Dict, List, Tuple
 
-from flask import Blueprint, jsonify, request, g
+from flask import g, jsonify, request
+from app.openapi.blueprint import HumanBlueprint as Blueprint
 
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
@@ -23,7 +24,7 @@ from app.utils.auth import login_required
 
 logger = get_logger(__name__)
 
-dashboard_bp = Blueprint("dashboard", __name__)
+dashboard_blp = Blueprint("dashboard", __name__)
 
 
 def _safe_int(v: Any, default: int) -> int:
@@ -40,12 +41,26 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return default
 
 
+def _net_trade_pnl(t: Dict[str, Any]) -> float:
+    """Realised P&L after open + close commissions (USDT-margined pairs)."""
+    from app.utils.trade_net_pnl import net_pnl_for_equity_step
+
+    return float(net_pnl_for_equity_step(t))
+
+
 def _format_datetime(dt: Any) -> Any:
-    """Convert datetime object to ISO format string for JSON serialization."""
+    """Convert a datetime to a UTC ISO 8601 string for the frontend.
+
+    Naive datetimes from the DB are interpreted in the server's wall-clock
+    time zone (container ``TZ`` env var) — the previous implementation
+    assumed UTC, which is only correct on UTC deployments and silently
+    shifted timestamps by 8 hours on the default ``Asia/Shanghai`` setup.
+    """
     if dt is None:
         return None
     if hasattr(dt, 'isoformat'):
-        return dt.isoformat()
+        from app.utils.timeutil import to_utc_iso
+        return to_utc_iso(dt)
     return dt
 
 
@@ -81,79 +96,105 @@ def _as_list(value: Any) -> List[str]:
     return []
 
 
-def _calc_unrealized_pnl(side: str, entry_price: float, current_price: float, size: float) -> float:
+def _is_bot_strategy(row: Dict[str, Any]) -> bool:
     try:
-        ep = float(entry_price or 0.0)
-        cp = float(current_price or 0.0)
-        sz = float(size or 0.0)
-        if ep <= 0 or cp <= 0 or sz <= 0:
-            return 0.0
-        s = (side or "").strip().lower()
-        if s == "short":
-            return (ep - cp) * sz
-        return (cp - ep) * sz
+        mode = str((row or {}).get("strategy_mode") or "").strip().lower()
+        return mode == "bot"
     except Exception:
-        return 0.0
+        return False
 
 
-def _calc_pnl_percent(entry_price: float, size: float, pnl: float, leverage: float = 1.0, market_type: str = "spot") -> float:
-    try:
-        denom = float(entry_price or 0.0) * float(size or 0.0)
-        if denom <= 0:
-            return 0.0
-        lev = float(leverage or 1.0)
-        if lev <= 0:
-            lev = 1.0
-        mt = str(market_type or "").strip().lower()
-        # Margin PnL% (user expectation): pnl / (notional / leverage)
-        # = pnl / notional * leverage
-        mult = lev if mt in ("swap", "futures", "future", "perp", "perpetual") else 1.0
-        return float(pnl) / denom * 100.0 * float(mult)
-    except Exception:
-        return 0.0
+def _strategy_bucket(row: Dict[str, Any]) -> str:
+    """Classify a strategy row into signal (indicator) / script / bot."""
+    if _is_bot_strategy(row):
+        return "bot"
+    mode = str((row or {}).get("strategy_mode") or "").strip().lower()
+    if mode == "script":
+        return "script"
+    st = str((row or {}).get("strategy_type") or "").strip()
+    if st == "ScriptStrategy":
+        return "script"
+    return "signal"
+
+
+from app.utils.pnl import calc_pnl_percent, calc_unrealized_pnl
 
 
 def _compute_performance_stats(trades: List[Dict[str, Any]], initial_capital: float = 0.0) -> Dict[str, Any]:
     """
     Compute performance statistics from trade history.
+
+    Important: ``qd_strategy_trades`` stores one row per trade *event*, not per
+    round-trip. There are two kinds of rows:
+      * Opens / adds (``open_long``, ``open_short``, ``add_long`` …) — these
+        carry ``profit = NULL`` because no P&L is realised yet.
+      * Closes / reduces — these carry a signed numeric ``profit``.
+
+    Historically the win-rate denominator here was ``len(trades)``, which is
+    the count of *all* events including opens. That made a strategy with
+    "2 wins / 0 losses" display as ``2 / 11 events ≈ 18.2%`` win rate. The
+    correct denominator is the number of *decided* (closed and non-breakeven)
+    trades. To make every downstream metric consistent we now also restrict
+    profit-factor, averages, max-win/loss and the equity curve to the closing
+    trades, and report ``total_trades`` as the count of closing trades — open
+    rows are bookkeeping noise as far as performance scoring is concerned.
+
     Args:
-        trades: List of trade records
-        initial_capital: Initial capital for calculating equity curve (default: 0.0, will use cumulative profit peak as baseline)
+        trades: List of trade records (mix of opens and closes — both fine).
+        initial_capital: Initial capital for the equity curve; used to anchor
+            the drawdown percentage when the cumulative profit is negative.
+
     Returns: {
         total_trades, winning_trades, losing_trades, win_rate,
         total_profit, total_loss, profit_factor,
         avg_win, avg_loss, avg_trade,
-        max_win, max_loss, max_drawdown, max_drawdown_pct
+        max_win, max_loss, max_drawdown, max_drawdown_pct,
+        best_day, worst_day
     }
     """
-    total_trades = len(trades)
-    if total_trades == 0:
-        return {
-            "total_trades": 0,
-            "winning_trades": 0,
-            "losing_trades": 0,
-            "win_rate": 0.0,
-            "total_profit": 0.0,
-            "total_loss": 0.0,
-            "profit_factor": 0.0,
-            "avg_win": 0.0,
-            "avg_loss": 0.0,
-            "avg_trade": 0.0,
-            "max_win": 0.0,
-            "max_loss": 0.0,
-            "max_drawdown": 0.0,
-            "max_drawdown_pct": 0.0,
-            "best_day": 0.0,
-            "worst_day": 0.0,
-        }
+    empty_stats = {
+        "total_trades": 0,
+        "winning_trades": 0,
+        "losing_trades": 0,
+        "win_rate": 0.0,
+        "total_profit": 0.0,
+        "total_loss": 0.0,
+        "profit_factor": 0.0,
+        "avg_win": 0.0,
+        "avg_loss": 0.0,
+        "avg_trade": 0.0,
+        "max_win": 0.0,
+        "max_loss": 0.0,
+        "max_drawdown": 0.0,
+        "max_drawdown_pct": 0.0,
+        "best_day": 0.0,
+        "worst_day": 0.0,
+    }
+    if not trades:
+        return empty_stats
 
-    profits = [_safe_float(t.get("profit"), 0.0) for t in trades]
+    # Keep only rows that carry a realised P&L. ``profit`` being None is the
+    # canonical "this is an open / add event" signal in qd_strategy_trades;
+    # rows where the column is missing entirely (legacy / migrated data) get
+    # the same treatment. Explicit ``profit = 0`` rows are kept — they are
+    # break-even closes and still count toward total_trades / avg_trade, just
+    # not toward wins or losses.
+    closing_trades = [t for t in trades if t.get("profit") is not None]
+    total_trades = len(closing_trades)
+    if total_trades == 0:
+        return empty_stats
+
+    profits = [_net_trade_pnl(t) for t in closing_trades]
     wins = [p for p in profits if p > 0]
     losses = [p for p in profits if p < 0]
 
     winning_trades = len(wins)
     losing_trades = len(losses)
-    win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0.0
+    # The denominator must exclude break-even closes (profit == 0) because
+    # they are neither a win nor a loss and would otherwise drag the rate
+    # toward an arbitrary direction depending on rounding.
+    decided_trades = winning_trades + losing_trades
+    win_rate = (winning_trades / decided_trades * 100) if decided_trades > 0 else 0.0
 
     total_profit = sum(wins) if wins else 0.0
     total_loss = abs(sum(losses)) if losses else 0.0
@@ -210,14 +251,17 @@ def _compute_performance_stats(trades: List[Dict[str, Any]], initial_capital: fl
     if max_drawdown_pct > 10000:
         max_drawdown_pct = 10000.0
 
-    # Best/worst day
+    # Best/worst day — only closing trades carry realised P&L, so iterate over
+    # the same filtered set we used above. Open events with profit=NULL would
+    # otherwise create empty "0 P&L" days for the date they were opened, which
+    # is technically harmless but masks days that legitimately had no trades.
     day_profits: Dict[str, float] = {}
-    for t in trades:
+    for t in closing_trades:
         ts = _safe_int(t.get("created_at"), 0)
         if ts <= 0:
             continue
         day = time.strftime("%Y-%m-%d", time.localtime(ts))
-        profit = _safe_float(t.get("profit"), 0.0)
+        profit = _net_trade_pnl(t)
         day_profits[day] = day_profits.get(day, 0.0) + profit
 
     best_day = max(day_profits.values()) if day_profits else 0.0
@@ -252,12 +296,14 @@ def _compute_strategy_stats(trades: List[Dict[str, Any]], strategies: List[Dict[
     existing_strategy_ids: set = set()
     sid_to_name: Dict[int, str] = {}
     sid_to_capital: Dict[int, float] = {}
+    sid_to_bucket: Dict[int, str] = {}
     for s in strategies:
         sid = _safe_int(s.get("id"), 0)
         if sid > 0:
             existing_strategy_ids.add(sid)
             sid_to_name[sid] = str(s.get("strategy_name") or f"Strategy_{sid}")
             sid_to_capital[sid] = _safe_float(s.get("initial_capital"), 0.0)
+            sid_to_bucket[sid] = _strategy_bucket(s)
 
     # Group trades by strategy (only for existing strategies)
     sid_to_trades: Dict[int, List[Dict[str, Any]]] = {}
@@ -274,12 +320,13 @@ def _compute_strategy_stats(trades: List[Dict[str, Any]], strategies: List[Dict[
     for sid, strades in sid_to_trades.items():
         capital = sid_to_capital.get(sid, 0.0)
         stats = _compute_performance_stats(strades, initial_capital=capital)
-        total_pnl = sum(_safe_float(t.get("profit"), 0.0) for t in strades)
+        total_pnl = sum(_net_trade_pnl(t) for t in strades)
         roi = (total_pnl / capital * 100) if capital > 0 else 0.0
 
         result.append({
             "strategy_id": sid,
             "strategy_name": sid_to_name.get(sid, f"Strategy_{sid}"),
+            "strategy_bucket": sid_to_bucket.get(sid, "signal"),
             "total_trades": stats["total_trades"],
             "win_rate": stats["win_rate"],
             "profit_factor": stats["profit_factor"],
@@ -293,11 +340,11 @@ def _compute_strategy_stats(trades: List[Dict[str, Any]], strategies: List[Dict[
     return result
 
 
-@dashboard_bp.route("/summary", methods=["GET"])
+@dashboard_blp.route("/summary", methods=["GET"])
 @login_required
 def summary():
     """
-    Return dashboard summary used by `quantdinger_vue/src/views/dashboard/index.vue`.
+    Return dashboard summary used by the frontend dashboard view (private Vue repo).
     """
     try:
         user_id = g.user_id
@@ -307,7 +354,7 @@ def summary():
             cur = db.cursor()
             cur.execute(
                 """
-                SELECT id, strategy_name, strategy_type, status, initial_capital, trading_config
+                SELECT id, strategy_name, strategy_type, status, initial_capital, trading_config, strategy_mode
                 FROM qd_strategies_trading
                 WHERE user_id = ?
                 """,
@@ -317,7 +364,12 @@ def summary():
             cur.close()
 
         running = [s for s in strategies if (s.get("status") or "").strip().lower() == "running"]
-        indicator_strategy_count = len([s for s in running if (s.get("strategy_type") or "") == "IndicatorStrategy"])
+        running_strategy_count = len(running)
+        running_indicator_count = len([s for s in running if _strategy_bucket(s) == "signal"])
+        running_script_count = len([s for s in running if _strategy_bucket(s) == "script"])
+        running_bot_count = len([s for s in running if _strategy_bucket(s) == "bot"])
+        # Backward-compatible alias: previously only counted running indicator strategies.
+        indicator_strategy_count = running_indicator_count
 
         # "AI strategies" in dashboard card: count strategies that enabled AI analysis/filtering.
         # This aligns with the UI toggle `enable_ai_filter` in trading_config.
@@ -343,11 +395,12 @@ def summary():
                 """
                 SELECT p.*, s.strategy_name, s.initial_capital, s.leverage, s.market_type
                 FROM qd_strategy_positions p
-                LEFT JOIN qd_strategies_trading s ON s.id = p.strategy_id
+                INNER JOIN qd_strategies_trading s ON s.id = p.strategy_id
                 WHERE p.user_id = ?
+                  AND s.user_id = ?
                 ORDER BY p.updated_at DESC
                 """,
-                (user_id,)
+                (user_id, user_id)
             )
             rows = cur.fetchall() or []
             cur.close()
@@ -355,13 +408,13 @@ def summary():
         current_positions: List[Dict[str, Any]] = []
         total_unrealized_pnl = 0.0
         for r in rows:
-            pnl = _calc_unrealized_pnl(
+            pnl = calc_unrealized_pnl(
                 side=str(r.get("side") or ""),
                 entry_price=float(r.get("entry_price") or 0.0),
                 current_price=float(r.get("current_price") or 0.0),
                 size=float(r.get("size") or 0.0),
             )
-            pct = _calc_pnl_percent(
+            pct = calc_pnl_percent(
                 float(r.get("entry_price") or 0.0),
                 float(r.get("size") or 0.0),
                 pnl,
@@ -379,11 +432,38 @@ def summary():
             )
 
         # Recent trades (best-effort, filtered by user_id)
-        # Also compute all-time trade count for dashboard top cards.
+        # Also compute all-time trade count for dashboard top cards. We count
+        # only *closing* trades (``profit IS NOT NULL``) so this card agrees
+        # with the per-strategy "Trades" column and with the win-rate
+        # denominator — otherwise users see e.g. "11 trades, 18% win rate"
+        # on the top card while a strategy shows "2 trades, 100% win rate",
+        # and naturally assume one of them is broken.
         with get_db_connection() as db:
             cur = db.cursor()
-            cur.execute("SELECT COUNT(1) AS cnt FROM qd_strategy_trades WHERE user_id = ?", (user_id,))
+            cur.execute(
+                """
+                SELECT COUNT(1) AS cnt
+                FROM qd_strategy_trades t
+                INNER JOIN qd_strategies_trading s ON s.id = t.strategy_id
+                WHERE t.user_id = ?
+                  AND s.user_id = ?
+                  AND t.profit IS NOT NULL
+                """,
+                (user_id, user_id)
+            )
             total_trades_all = int((cur.fetchone() or {}).get("cnt") or 0)
+            cur.execute(
+                """
+                SELECT COALESCE(SUM(COALESCE(t.profit, 0) - COALESCE(t.commission, 0)), 0) AS total
+                FROM qd_strategy_trades t
+                INNER JOIN qd_strategies_trading s ON s.id = t.strategy_id
+                WHERE t.user_id = ?
+                  AND s.user_id = ?
+                  AND t.profit IS NOT NULL
+                """,
+                (user_id, user_id)
+            )
+            total_realized_pnl_all = float((cur.fetchone() or {}).get("total") or 0.0)
             cur.close()
 
         with get_db_connection() as db:
@@ -392,22 +472,27 @@ def summary():
                 """
                 SELECT t.*, s.strategy_name
                 FROM qd_strategy_trades t
-                LEFT JOIN qd_strategies_trading s ON s.id = t.strategy_id
+                INNER JOIN qd_strategies_trading s ON s.id = t.strategy_id
                 WHERE t.user_id = ?
+                  AND s.user_id = ?
                 ORDER BY t.created_at DESC
                 LIMIT 500
                 """,
-                (user_id,)
+                (user_id, user_id)
             )
             recent_trades_raw = cur.fetchall() or []
             cur.close()
         
         # Convert datetime to timestamp for frontend compatibility
+        from datetime import timezone as _tz
         recent_trades = []
         for t in recent_trades_raw:
             trade = dict(t)
-            if trade.get('created_at') and hasattr(trade['created_at'], 'timestamp'):
-                trade['created_at'] = int(trade['created_at'].timestamp())
+            ca = trade.get('created_at')
+            if ca and hasattr(ca, 'timestamp'):
+                if getattr(ca, 'tzinfo', None) is None:
+                    ca = ca.replace(tzinfo=_tz.utc)
+                trade['created_at'] = int(ca.timestamp())
             recent_trades.append(trade)
 
         # Total equity/pnl (best-effort) - calculate before performance stats for drawdown calculation
@@ -419,6 +504,9 @@ def summary():
                 pass
 
         # Compute performance statistics with initial capital for proper drawdown calculation
+        from app.utils.trade_net_pnl import enrich_trades_net_pnl
+
+        enrich_trades_net_pnl(recent_trades)
         perf_stats = _compute_performance_stats(recent_trades, initial_capital=total_initial_capital)
         # For dashboard top card: show all-time total trade count (not limited by LIMIT 500).
         perf_stats["total_trades"] = int(total_trades_all)
@@ -426,8 +514,8 @@ def summary():
         # Compute per-strategy statistics
         strategy_stats = _compute_strategy_stats(recent_trades, strategies)
 
-        # Include realized PnL from trades
-        total_realized_pnl = sum(_safe_float(t.get("profit"), 0.0) for t in recent_trades)
+        # All-time realized PnL for equity cards; recent_trades is capped at 500 rows.
+        total_realized_pnl = float(total_realized_pnl_all)
         total_pnl = float(total_unrealized_pnl + total_realized_pnl)
         total_equity = float(total_initial_capital + total_pnl)
 
@@ -439,10 +527,7 @@ def summary():
             if ts <= 0:
                 continue
             day = time.strftime("%Y-%m-%d", time.localtime(ts))
-            try:
-                p = float(trow.get("profit") or 0.0)
-            except Exception:
-                p = 0.0
+            p = _net_trade_pnl(trow)
             day_to_profit[day] = float(day_to_profit.get(day, 0.0) + p)
         daily_pnl_chart = [{"date": d, "profit": float(v)} for d, v in sorted(day_to_profit.items())]
 
@@ -462,10 +547,7 @@ def summary():
             if ts <= 0:
                 continue
             month = time.strftime("%Y-%m", time.localtime(ts))
-            try:
-                p = float(trow.get("profit") or 0.0)
-            except Exception:
-                p = 0.0
+            p = _net_trade_pnl(trow)
             month_to_profit[month] = month_to_profit.get(month, 0.0) + p
         monthly_returns = [{"month": m, "profit": round(v, 2)} for m, v in sorted(month_to_profit.items())]
 
@@ -478,7 +560,7 @@ def summary():
                 continue
             hour = int(time.strftime("%H", time.localtime(ts)))
             hour_to_count[hour] = hour_to_count.get(hour, 0) + 1
-            hour_to_profit[hour] = hour_to_profit.get(hour, 0.0) + _safe_float(trow.get("profit"), 0.0)
+            hour_to_profit[hour] = hour_to_profit.get(hour, 0.0) + _net_trade_pnl(trow)
         hourly_distribution = [
             {"hour": h, "count": hour_to_count.get(h, 0), "profit": round(hour_to_profit.get(h, 0.0), 2)}
             for h in range(24)
@@ -536,6 +618,10 @@ def summary():
                 "data": {
                     "ai_strategy_count": int(ai_enabled_strategy_count),
                     "indicator_strategy_count": int(indicator_strategy_count),
+                    "running_strategy_count": int(running_strategy_count),
+                    "running_indicator_count": int(running_indicator_count),
+                    "running_script_count": int(running_script_count),
+                    "running_bot_count": int(running_bot_count),
                     "total_equity": round(total_equity, 2),
                     "total_pnl": round(total_pnl, 2),
                     "total_realized_pnl": round(total_realized_pnl, 2),
@@ -561,7 +647,7 @@ def summary():
         return jsonify({"code": 0, "msg": str(e), "data": None}), 500
 
 
-@dashboard_bp.route("/pendingOrders", methods=["GET"])
+@dashboard_blp.route("/pendingOrders", methods=["GET"])
 @login_required
 def pending_orders():
     """
@@ -680,7 +766,7 @@ def pending_orders():
         return jsonify({"code": 0, "msg": str(e), "data": None}), 500
 
 
-@dashboard_bp.route("/pendingOrders/<int:order_id>", methods=["DELETE"])
+@dashboard_blp.route("/pendingOrders/<int:order_id>", methods=["DELETE"])
 @login_required
 def delete_pending_order(order_id: int):
     """
@@ -712,3 +798,6 @@ def delete_pending_order(order_id: int):
     except Exception as e:
         logger.error(f"dashboard delete pendingOrders failed: {e}", exc_info=True)
         return jsonify({"code": 0, "msg": str(e), "data": None}), 500
+
+# openapi-compat: legacy import name
+dashboard_bp = dashboard_blp

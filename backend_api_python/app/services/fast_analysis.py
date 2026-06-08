@@ -208,7 +208,6 @@ class FastAnalysisService:
         *,
         include_macro: bool = True,
         include_news: bool = True,
-        include_polymarket: bool = True,
         timeout: int = 45,
     ) -> Dict[str, Any]:
         """
@@ -219,7 +218,6 @@ class FastAnalysisService:
         2. 基本面: 公司信息、财务数据
         3. 宏观数据: DXY、VIX、TNX、黄金等
         4. 情绪数据: 新闻、市场情绪
-        5. 预测市场: 相关预测市场事件（新增）
         """
         return self.data_collector.collect_all(
             market=market,
@@ -227,7 +225,6 @@ class FastAnalysisService:
             timeframe=timeframe,
             include_macro=include_macro,
             include_news=include_news,
-            include_polymarket=include_polymarket,  # 包含预测市场数据
             timeout=timeout,  # 增加超时时间，确保数据收集完成
         )
     
@@ -371,18 +368,67 @@ class FastAnalysisService:
         
         return "\n".join(summaries) if summaries else "No recent news available."
     
-    def _format_polymarket_summary(self, polymarket_events: List[Dict], max_items: int = 3) -> str:
-        """Format prediction market events into a concise summary for the prompt."""
-        if not polymarket_events:
-            return "No related prediction market events found."
-        
-        summaries = []
-        for event in polymarket_events[:max_items]:
-            question = event.get('question', '')
-            prob = event.get('current_probability', 50.0)
-            summaries.append(f"- {question[:80]}: Market probability {prob:.1f}%")
-        
-        return "\n".join(summaries) if summaries else "No related prediction market events found."
+    def _format_crypto_factor_prompt(self, crypto_factors: Dict[str, Any], language: str) -> str:
+        """Format crypto-specific market structure data for prompts."""
+        if not crypto_factors:
+            return "Crypto flow / derivatives data unavailable."
+
+        is_zh = str(language or "").lower().startswith("zh")
+        signals = crypto_factors.get("signals") or {}
+
+        def _fmt_num(v: Any, suffix: str = "") -> str:
+            if v is None or v == "":
+                return "N/A"
+            try:
+                n = float(v)
+            except Exception:
+                return str(v)
+            if abs(n) >= 1_000_000_000:
+                return f"{n / 1_000_000_000:.2f}B{suffix}"
+            if abs(n) >= 1_000_000:
+                return f"{n / 1_000_000:.2f}M{suffix}"
+            if abs(n) >= 1_000:
+                return f"{n / 1_000:.2f}K{suffix}"
+            return f"{n:.4f}{suffix}" if abs(n) < 1 else f"{n:.2f}{suffix}"
+
+        def _fmt_pct(v: Any) -> str:
+            if v is None or v == "":
+                return "N/A"
+            try:
+                return f"{float(v):.2f}%"
+            except Exception:
+                return str(v)
+
+        if is_zh:
+            return (
+                f"- 24h成交额: {_fmt_num(crypto_factors.get('volume_24h'), ' USD')}\n"
+                f"- 成交活跃度变化: {_fmt_pct(crypto_factors.get('volume_change_24h'))}\n"
+                f"- 资金费率: {_fmt_pct(crypto_factors.get('funding_rate'))}\n"
+                f"- 未平仓量(OI): {_fmt_num(crypto_factors.get('open_interest'), ' USD')}\n"
+                f"- OI变化(24h): {_fmt_pct(crypto_factors.get('open_interest_change_24h'))}\n"
+                f"- 多空比: {_fmt_num(crypto_factors.get('long_short_ratio'))}\n"
+                f"- 交易所净流: {_fmt_num(crypto_factors.get('exchange_netflow'), ' USD')}\n"
+                f"- 稳定币净流: {_fmt_num(crypto_factors.get('stablecoin_netflow'), ' USD')}\n"
+                f"- 衍生品偏向: {signals.get('derivatives_bias', 'neutral')}\n"
+                f"- 资金流偏向: {signals.get('flow_bias', 'neutral')}\n"
+                f"- 挤仓风险: {signals.get('squeeze_risk', 'low')}\n"
+                f"- 因子摘要: {crypto_factors.get('summary') or '暂无'}"
+            )
+
+        return (
+            f"- 24h volume: {_fmt_num(crypto_factors.get('volume_24h'), ' USD')}\n"
+            f"- Volume activity change: {_fmt_pct(crypto_factors.get('volume_change_24h'))}\n"
+            f"- Funding rate: {_fmt_pct(crypto_factors.get('funding_rate'))}\n"
+            f"- Open interest: {_fmt_num(crypto_factors.get('open_interest'), ' USD')}\n"
+            f"- OI change (24h): {_fmt_pct(crypto_factors.get('open_interest_change_24h'))}\n"
+            f"- Long/short ratio: {_fmt_num(crypto_factors.get('long_short_ratio'))}\n"
+            f"- Exchange netflow: {_fmt_num(crypto_factors.get('exchange_netflow'), ' USD')}\n"
+            f"- Stablecoin netflow: {_fmt_num(crypto_factors.get('stablecoin_netflow'), ' USD')}\n"
+            f"- Derivatives bias: {signals.get('derivatives_bias', 'neutral')}\n"
+            f"- Flow bias: {signals.get('flow_bias', 'neutral')}\n"
+            f"- Squeeze risk: {signals.get('squeeze_risk', 'low')}\n"
+            f"- Factor summary: {crypto_factors.get('summary') or 'N/A'}"
+        )
     
     # ==================== Memory Layer ====================
     
@@ -434,8 +480,9 @@ class FastAnalysisService:
         indicators = data.get("indicators") or {}
         fundamental = data.get("fundamental") or {}
         company = data.get("company") or {}
+        crypto_factors = data.get("crypto_factors") or {}
+        is_crypto = str(data.get("market") or "").strip().lower() == "crypto"
         news_summary = self._format_news_summary(data.get("news") or [])
-        polymarket_events = data.get("polymarket") or []
         
         # Language instruction - MUST be enforced strictly
         lang_map = {
@@ -477,6 +524,23 @@ class FastAnalysisService:
         
         # Build decision guidance based on technical indicators
         decision_guidance = self._build_decision_guidance(rsi_value, macd_signal, ma_trend, change_24h)
+        crypto_factor_block = self._format_crypto_factor_prompt(crypto_factors, language)
+        crypto_system_rules = ""
+        crypto_user_block = ""
+        if is_crypto:
+            crypto_system_rules = """
+8. **Crypto Market Structure Override**:
+   - For Crypto, DO NOT rely on stock-style valuation logic as your core thesis.
+   - Prioritize derivatives positioning, funding rate, open interest, long/short ratio, exchange netflow, and stablecoin netflow.
+   - Positive funding + rising OI can confirm bullish momentum, but extreme values may also indicate crowded longs and squeeze risk.
+   - Exchange net outflow is generally constructive; large net inflow may imply sell pressure or risk-off hedging.
+   - Stablecoin net inflow can imply fresh buying power entering the market.
+   - If derivatives are crowded or squeeze risk is high, explicitly mention this in summary, reasons, and risks.
+"""
+            crypto_user_block = f"""
+🪙 CRYPTO MARKET STRUCTURE:
+{crypto_factor_block}
+"""
         
         system_prompt = f"""You are QuantDinger's Senior Financial Analyst with 20+ years of experience. 
 You are CONSERVATIVE and OBJECTIVE. Your analysis must be based on DATA, not speculation.
@@ -514,6 +578,7 @@ You are CONSERVATIVE and OBJECTIVE. Your analysis must be based on DATA, not spe
    - High VIX (>30) indicates fear → Consider SELL or HOLD, avoid BUY
    - Rising interest rates usually negative for growth assets → Consider SELL
    - Geopolitical tensions can cause sudden volatility → Consider SELL if risk-off sentiment
+{crypto_system_rules}
 
 {decision_guidance}
 
@@ -553,7 +618,7 @@ You are CONSERVATIVE and OBJECTIVE. Your analysis must be based on DATA, not spe
    - If prediction markets show high probability for bullish events (e.g., "BTC reaches $100k"), consider this as a positive signal
    - If prediction markets show high probability for bearish events, consider this as a risk factor
    - Use prediction market probabilities as a sentiment indicator alongside technical analysis
-5. **Fundamental Analysis**: Evaluate valuation, growth, competitive position if data available. If data is insufficient, say so.
+5. **Fundamental Analysis**: For Crypto, focus on market structure / flow / derivatives factors instead of stock-style valuation. For equities, evaluate valuation, growth, competitive position if data available.
 6. **Risk Assessment**: 
    - Explain why the stop loss level is appropriate
    - List ALL significant risks (technical, macro, news, fundamental)
@@ -634,6 +699,7 @@ When the score is neutral (-20 to +20), you can use your judgment, but still con
 - Volatility: {vol_data.get('level', 'N/A')} ({vol_data.get('pct', 0)}%)
 - Trend: {indicators.get('trend', 'N/A')}
 - Price Position (20d): {indicators.get('price_position', 'N/A')}%
+{crypto_user_block}
 
 🌐 MACRO ENVIRONMENT:
 {macro_summary}
@@ -641,10 +707,7 @@ When the score is neutral (-20 to +20), you can use your judgment, but still con
 📰 MARKET NEWS ({len(data.get('news') or [])} items):
 {news_summary}
 
-🎯 PREDICTION MARKETS ({len(polymarket_events)} related events):
-{self._format_polymarket_summary(polymarket_events)}
-
-💼 FUNDAMENTALS:
+💼 FUNDAMENTALS / MARKET STRUCTURE:
 - Company: {company.get('name', data['symbol'])}
 - Industry: {company.get('industry', 'N/A')}
 - P/E Ratio: {fundamental.get('pe_ratio', 'N/A')}
@@ -671,7 +734,7 @@ IMPORTANT:
 1. **CRITICAL**: Check for GEOPOLITICAL EVENTS (wars, conflicts, military actions) in the news section. These events have HIGHEST PRIORITY and can override all technical indicators.
 2. Consider the macro environment (especially DXY, VIX, rates, geopolitical events) when making your recommendation.
 3. Pay attention to BREAKING NEWS and international events that could cause sudden market moves. Geopolitical tensions (e.g., US-Iran conflict) can cause severe market volatility.
-4. For US stocks, analyze financial statements and earnings trends to assess company health.
+4. For Crypto, explicitly explain whether derivatives + capital flow data confirm or contradict price action. For US stocks, analyze financial statements and earnings trends to assess company health.
 5. If you see news about wars, conflicts, or major geopolitical events, you MUST mention them in your analysis and adjust your recommendation accordingly.
 6. Provide your analysis now. Remember: all prices must be within 10% of ${current_price}."""
 
@@ -908,14 +971,13 @@ IMPORTANT:
                 # De-dup keep order
                 seen = set()
                 consensus_timeframes = [x for x in consensus_timeframes if not (x in seen or seen.add(x))]
-            # Collect primary data including macro/news/polymarket for prompt quality
+            # Collect primary data (macro + news) for prompt quality
             primary_data = self._collect_market_data(
                 market,
                 symbol,
                 primary_tf,
                 include_macro=True,
                 include_news=True,
-                include_polymarket=True,
             )
 
             # Collect extra timeframes for objective consensus (technical-only for cost)
@@ -961,7 +1023,6 @@ IMPORTANT:
                         tf_norm,
                         include_macro=False,
                         include_news=False,
-                        include_polymarket=False,
                         timeout=25,
                     )
 
@@ -979,8 +1040,21 @@ IMPORTANT:
                 }
                 decision_votes[decision] = decision_votes.get(decision, 0) + 1
 
-                # Weight by strength so strong cycles dominate
-                w = 1.0 + min(1.5, abs_score / 100.0)
+                # Weight by timeframe and strength. Longer frames should anchor
+                # regime direction; short-frame oversold bounces must not
+                # dominate a 1D/1W downtrend.
+                tf_base_weights = {
+                    "1M": 0.75,
+                    "3M": 0.75,
+                    "5M": 0.80,
+                    "15M": 0.85,
+                    "30M": 0.90,
+                    "1H": 0.95,
+                    "4H": 1.10,
+                    "1D": 1.30,
+                    "1W": 1.35,
+                }
+                w = float(tf_base_weights.get(tf_norm, 1.0)) * (1.0 + min(1.0, abs_score / 100.0))
                 weighted_score_sum += overall_score * w
                 weighted_score_w_sum += w
 
@@ -994,7 +1068,6 @@ IMPORTANT:
                         "1W",
                         include_macro=False,
                         include_news=False,
-                        include_polymarket=False,
                         timeout=25,
                     )
                     cp_1w = _extract_current_price(d_1w) or 0.0
@@ -1018,7 +1091,6 @@ IMPORTANT:
                         "1H",
                         include_macro=False,
                         include_news=False,
-                        include_polymarket=False,
                         timeout=18,
                     )
                     cp_1h = _extract_current_price(d_1h) or 0.0
@@ -1050,8 +1122,6 @@ IMPORTANT:
                 quality_multiplier *= 0.85
             if "news" in failed_items:
                 quality_multiplier *= 0.8
-            if "polymarket" in failed_items:
-                quality_multiplier *= 0.9
             # If indicators missing key sections, reduce confidence more
             ind = primary_data.get("indicators") or {}
             if not ind or not ind.get("rsi") or not ind.get("moving_averages"):
@@ -1164,9 +1234,13 @@ IMPORTANT:
                 f"(Technical: {objective_score['technical_score']:.1f}, Fundamental: {objective_score['fundamental_score']:.1f}, "
                 f"Sentiment: {objective_score['sentiment_score']:.1f}, Macro: {objective_score['macro_score']:.1f})"
             )
+            crypto_factor_score = objective_score.get("crypto_factor_score")
+            crypto_factor_summary = objective_score.get("crypto_factor_summary") or (data.get("crypto_factors") or {}).get("summary", "")
 
             score_based_decision = self._score_to_decision(objective_score["overall_score"], market=market)
             llm_decision = str(analysis.get("decision", "HOLD") or "HOLD").upper()
+            if market == "Crypto" and crypto_factor_score is not None:
+                analysis["fundamental_score"] = max(0, min(100, int(round((float(crypto_factor_score) + 100.0) / 2.0))))
 
             # Horizon trend outlook for users (short/medium/long decision reference)
             score_1d = float((objective_by_tf.get("1D") or {}).get("overall_score", objective_score.get("overall_score", 0.0)) or 0.0)
@@ -1177,6 +1251,15 @@ IMPORTANT:
             score_1w = float((objective_by_tf.get("1W") or {}).get("overall_score", score_1d) or score_1d)
             score_3d = score_1d * 0.7 + score_4h * 0.3
             score_1m = score_1w * 0.55 + float(objective_score.get("fundamental_score", 0.0)) * 0.30 + float(objective_score.get("macro_score", 0.0)) * 0.15
+            horizon_risk = self._technical_risk_context(data.get("indicators") or {}, data.get("price") or {})
+            if horizon_risk.get("panic_breakdown"):
+                score_24h = min(score_24h, -20.0)
+                score_3d = min(score_3d, -10.0)
+                score_1w = min(score_1w, 0.0)
+                score_1m = min(score_1m, 10.0)
+            elif horizon_risk.get("bearish_context") and horizon_risk.get("change_24h", 0.0) <= -3.0:
+                score_24h = min(score_24h, 5.0)
+                score_3d = min(score_3d, 10.0)
 
             def _trend_strength(score_val: float) -> str:
                 a = abs(float(score_val))
@@ -1223,8 +1306,15 @@ IMPORTANT:
             min_abs_override = float(cfg.get("min_consensus_abs_override") or 15.0)
             quality_hold_thr = float(cfg.get("quality_hold_threshold") or 0.7)
             regime = self._detect_market_regime(data.get("indicators") or {})
+            risk_context = self._technical_risk_context(data.get("indicators") or {}, data.get("price") or {})
             if regime == "ranging":
                 min_abs_override *= 1.2
+            if (
+                consensus_decision == "BUY"
+                and llm_decision in ("SELL", "HOLD")
+                and (risk_context.get("panic_breakdown") or risk_context.get("bearish_context"))
+            ):
+                min_abs_override = max(min_abs_override, 55.0 if risk_context.get("panic_breakdown") else 40.0)
 
             if consensus_abs >= min_abs_override:
                 final_decision = consensus_decision
@@ -1277,6 +1367,7 @@ IMPORTANT:
                 "agreement_ratio": agreement_ratio,
                 "quality_multiplier": quality_multiplier,
                 "market_regime": regime,
+                "risk_context": risk_context,
             }
             
             # Phase 5: Validate and constrain output (pass indicators for decision validation)
@@ -1328,6 +1419,8 @@ IMPORTANT:
             if isinstance(detailed_analysis, str):
                 # If AI returned a string instead of dict, use it as technical analysis
                 detailed_analysis = {"technical": detailed_analysis, "fundamental": "", "sentiment": ""}
+            if market == "Crypto" and not detailed_analysis.get("fundamental"):
+                detailed_analysis["fundamental"] = crypto_factor_summary or (data.get("crypto_factors") or {}).get("summary", "")
             
             result.update({
                 "decision": analysis.get("decision", "HOLD"),
@@ -1365,6 +1458,10 @@ IMPORTANT:
                     "overall": self._calculate_overall_score(analysis),
                 },
                 "objective_score": analysis.get("objective_score", {}),
+                "crypto_factors": data.get("crypto_factors", {}),
+                "crypto_factor_score": crypto_factor_score,
+                "crypto_factor_breakdown": objective_score.get("crypto_factor_breakdown", []),
+                "crypto_factor_summary": crypto_factor_summary,
                 "score_based_decision": analysis.get("score_based_decision", "HOLD"),
                 "market_data": {
                     "current_price": current_price,
@@ -1402,6 +1499,8 @@ IMPORTANT:
         强调SELL信号是有效的做空机会。
         """
         guidance_parts = []
+        ma_trend_low = str(ma_trend or "").lower()
+        bearish_guidance_context = bool("downtrend" in ma_trend_low or macd_signal == "bearish")
         
         # RSI 指导 - 更积极地识别做空机会
         if rsi_value > 70:
@@ -1448,11 +1547,15 @@ IMPORTANT:
             change_24h > 5
         ])
         buy_signals = sum([
-            rsi_value < 40,
+            (rsi_value < 40 and not bearish_guidance_context),
             macd_signal == "bullish",
-            "uptrend" in ma_trend.lower(),
-            change_24h < -5
+            "uptrend" in ma_trend_low,
+            (change_24h < -5 and not bearish_guidance_context)
         ])
+        if bearish_guidance_context and (rsi_value < 40 or change_24h < -5):
+            guidance_parts.append(
+                "Risk context: oversold RSI / sharp drop appears inside a bearish trend; treat it as continuation risk until reversal confirmation."
+            )
         
         if sell_signals >= 2:
             guidance_parts.append(f"📊 综合判断: {sell_signals}个做空信号，建议考虑SELL")
@@ -1812,12 +1915,17 @@ IMPORTANT:
         news = data.get("news") or []
         macro = data.get("macro") or {}
         price_data = data.get("price") or {}
+        crypto_factors = data.get("crypto_factors") or {}
         
         # 1. 技术指标评分 (-100 to +100)
         technical_score = self._calculate_technical_score(indicators, price_data)
         
         # 2. 基本面评分 (-100 to +100)
         fundamental_score = self._calculate_fundamental_score(fundamental, data.get("market", ""))
+        crypto_factor_objective = self._calculate_crypto_factor_score(crypto_factors, price_data)
+        crypto_factor_score = float(crypto_factor_objective.get("score", 0.0) or 0.0)
+        if str(data.get("market") or "").strip() == "Crypto" and crypto_factors:
+            fundamental_score = crypto_factor_score
         
         # 3. 新闻情绪评分 (-100 to +100)
         sentiment_score = self._calculate_sentiment_score(news)
@@ -1830,7 +1938,37 @@ IMPORTANT:
         # 但要做“可用信息重加权”：当某些模块缺失（如新闻/宏观没取到），不要用0分去稀释整体强度，
         # 而是重新归一化权重，让技术信号在缺失时仍可发挥主导作用。
         market_type = str(data.get("market") or "")
-        fundamental_present = (market_type == "USStock") and bool(fundamental)
+
+        def _fundamental_meaningful(fund: Dict[str, Any]) -> bool:
+            if not fund:
+                return False
+            for key in (
+                "pe_ratio",
+                "pb_ratio",
+                "ps_ratio",
+                "market_cap",
+                "roe",
+                "eps",
+                "revenue_growth",
+                "profit_margin",
+                "dividend_yield",
+            ):
+                v = fund.get(key)
+                if v is None or v == "":
+                    continue
+                try:
+                    if isinstance(v, float) and v != v:  # NaN
+                        continue
+                    return True
+                except Exception:
+                    return True
+            return False
+
+        fundamental_present = (
+            market_type in ("USStock", "CNStock", "HKStock") and _fundamental_meaningful(fundamental)
+        )
+        if market_type == "Crypto" and crypto_factors:
+            fundamental_present = True
         sentiment_present = bool(news)
         macro_present = bool(macro)
         # indicators 一旦成功计算通常就存在，但这里也做一次保护
@@ -1865,7 +2003,10 @@ IMPORTANT:
             "fundamental_score": fundamental_score,
             "sentiment_score": sentiment_score,
             "macro_score": macro_score,
-            "overall_score": overall_score
+            "overall_score": overall_score,
+            "crypto_factor_score": crypto_factor_score,
+            "crypto_factor_breakdown": crypto_factor_objective.get("breakdown", []),
+            "crypto_factor_summary": crypto_factor_objective.get("summary") or (crypto_factors.get("summary") if crypto_factors else ""),
         }
 
     def _get_ai_calibration(self, market: str = "Crypto") -> Dict[str, Any]:
@@ -1895,11 +2036,53 @@ IMPORTANT:
         self._calibration_cache[key] = cfg
         self._calibration_cache_ts[key] = now
         return cfg
+
+    def _technical_risk_context(self, indicators: Dict, price_data: Dict) -> Dict[str, Any]:
+        """Classify whether oversold signals are likely reversal or breakdown risk."""
+        indicators = indicators or {}
+        price_data = price_data or {}
+        ma = indicators.get("moving_averages") or {}
+        macd = indicators.get("macd") or {}
+        trend = str(ma.get("trend") or indicators.get("trend") or "sideways").lower()
+        macd_signal = str(macd.get("signal") or "neutral").lower()
+        try:
+            change_24h = float(price_data.get("changePercent") or 0.0)
+        except Exception:
+            change_24h = 0.0
+        try:
+            volume_ratio = float(indicators.get("volume_ratio") or 1.0)
+        except Exception:
+            volume_ratio = 1.0
+        try:
+            rsi_value = float((indicators.get("rsi") or {}).get("value") or 50.0)
+        except Exception:
+            rsi_value = 50.0
+
+        strong_downtrend = "strong_downtrend" in trend
+        downtrend = "downtrend" in trend
+        bearish_context = bool(downtrend or macd_signal == "bearish")
+        panic_breakdown = bool(
+            (strong_downtrend and macd_signal == "bearish" and change_24h <= -3.0)
+            or (downtrend and macd_signal == "bearish" and change_24h <= -5.0)
+            or (change_24h <= -8.0 and volume_ratio >= 1.3)
+        )
+        return {
+            "trend": trend,
+            "macd_signal": macd_signal,
+            "rsi": rsi_value,
+            "change_24h": change_24h,
+            "volume_ratio": volume_ratio,
+            "downtrend": downtrend,
+            "strong_downtrend": strong_downtrend,
+            "bearish_context": bearish_context,
+            "panic_breakdown": panic_breakdown,
+        }
     
     def _calculate_technical_score(self, indicators: Dict, price_data: Dict) -> float:
         """计算技术指标评分 (-100 to +100)"""
         score = 0.0
         weight_sum = 0.0
+        risk = self._technical_risk_context(indicators, price_data)
         
         # RSI 评分 (-50 to +50)
         rsi_data = indicators.get("rsi", {})
@@ -1915,6 +2098,13 @@ IMPORTANT:
                 rsi_score = +30  # 偏超卖，利多
             else:
                 rsi_score = (50 - rsi_value) * 0.6  # 40-60之间，线性映射
+            if rsi_value < 30:
+                if risk.get("panic_breakdown"):
+                    rsi_score = -10
+                elif risk.get("bearish_context"):
+                    rsi_score = min(rsi_score, 8)
+            elif rsi_value < 40 and risk.get("bearish_context"):
+                rsi_score = min(rsi_score, 6)
             score += rsi_score * 0.30
             weight_sum += 0.30
         
@@ -1958,6 +2148,10 @@ IMPORTANT:
             change_score = +10
         else:
             change_score = change_24h * 2  # 线性映射
+        if change_24h < -10:
+            change_score = -20 if risk.get("panic_breakdown") else (min(change_score, 5) if risk.get("bearish_context") else change_score)
+        elif change_24h < -5:
+            change_score = -10 if risk.get("panic_breakdown") else (min(change_score, 3) if risk.get("bearish_context") else change_score)
         score += change_score * 0.20
         weight_sum += 0.20
 
@@ -1980,6 +2174,10 @@ IMPORTANT:
                 pp_score -= 5
             elif pp <= 15:
                 pp_score += 5
+            if risk.get("bearish_context") and pp <= 20:
+                pp_score = min(pp_score, 3)
+            if risk.get("panic_breakdown") and pp <= 20:
+                pp_score = min(pp_score, -3)
             extra_score += pp_score
             extra_weight += 0.20
         except Exception:
@@ -1996,7 +2194,7 @@ IMPORTANT:
                     extra_score += -12
                     extra_weight += 0.20
                 elif cur_px <= bb_l:
-                    extra_score += +12
+                    extra_score += (-6 if risk.get("panic_breakdown") else (0 if risk.get("bearish_context") else +12))
                     extra_weight += 0.20
                 else:
                     # Within bands: small contribution by relative position
@@ -2015,7 +2213,7 @@ IMPORTANT:
                     extra_score += +8
                     extra_weight += 0.15
                 elif "downtrend" in trend:
-                    extra_score += -8
+                    extra_score += (-16 if risk.get("change_24h", 0.0) < 0 else -8)
                     extra_weight += 0.15
                 else:
                     # 放量但无趋势：更偏不确定，略微降低（当作偏利空风险）
@@ -2051,15 +2249,19 @@ IMPORTANT:
         
         # 归一化到-100到+100
         if weight_sum > 0:
-            score = score / weight_sum * 100
+            score = score / max(1.0, weight_sum)
+        if risk.get("panic_breakdown"):
+            score = min(score, -25.0)
+        elif risk.get("bearish_context") and risk.get("change_24h", 0.0) <= -3.0:
+            score = min(score, 5.0)
         
         return max(-100, min(100, score))
     
     def _calculate_fundamental_score(self, fundamental: Dict, market: str) -> float:
         """计算基本面评分 (-100 to +100)"""
-        if market != "USStock" or not fundamental:
-            return 0.0  # 非美股或无基本面数据，返回中性
-        
+        if market not in ("USStock", "CNStock", "HKStock") or not fundamental:
+            return 50.0
+
         score = 0.0
         factors = 0
         
@@ -2142,8 +2344,98 @@ IMPORTANT:
         # 归一化（如果有多个因素）
         if factors > 0:
             score = score / factors * 100 / 4  # 最大可能分数是4个因素各20分=80，归一化到100
-        
+        else:
+            return 50.0
+
         return max(-100, min(100, score))
+
+    def _calculate_crypto_factor_score(self, crypto_factors: Dict[str, Any], price_data: Dict[str, Any]) -> Dict[str, Any]:
+        """基于加密货币交易大数据因子计算可解释评分。"""
+        if not crypto_factors:
+            return {"score": 0.0, "breakdown": [], "summary": ""}
+
+        breakdown = []
+        score = 0.0
+
+        def add(name: str, value: float, reason: str):
+            nonlocal score
+            score += float(value)
+            breakdown.append({"factor": name, "score": round(float(value), 2), "reason": reason})
+
+        funding_rate = crypto_factors.get("funding_rate")
+        oi_change = crypto_factors.get("open_interest_change_24h")
+        long_short_ratio = crypto_factors.get("long_short_ratio")
+        exchange_netflow = crypto_factors.get("exchange_netflow")
+        stablecoin_netflow = crypto_factors.get("stablecoin_netflow")
+        volume_change = crypto_factors.get("volume_change_24h")
+        change_24h = (price_data or {}).get("changePercent")
+
+        try:
+            if funding_rate is not None and oi_change is not None:
+                fr = float(funding_rate)
+                oi = float(oi_change)
+                if fr > 0 and oi > 3:
+                    add("funding_oi", 18, "资金费率偏正且 OI 上升，衍生品多头动能增强")
+                elif fr < 0 and oi > 3:
+                    add("funding_oi", -18, "资金费率偏负且 OI 上升，空头动能增强")
+        except Exception:
+            pass
+
+        try:
+            if exchange_netflow is not None:
+                enf = float(exchange_netflow)
+                if enf < 0:
+                    add("exchange_netflow", 16, "交易所净流出，筹码倾向离场保管，通常偏利多")
+                elif enf > 0:
+                    add("exchange_netflow", -16, "交易所净流入，潜在卖压或风险对冲上升")
+        except Exception:
+            pass
+
+        try:
+            if stablecoin_netflow is not None:
+                stf = float(stablecoin_netflow)
+                if stf > 0:
+                    add("stablecoin_netflow", 12, "稳定币净流入增强，潜在买盘增加")
+                elif stf < 0:
+                    add("stablecoin_netflow", -12, "稳定币净流出，边际买盘转弱")
+        except Exception:
+            pass
+
+        try:
+            if long_short_ratio is not None:
+                lsr = float(long_short_ratio)
+                if lsr > 1.6:
+                    add("long_short_ratio", -10, "多空比过热，需警惕多头拥挤和长挤风险")
+                elif lsr < 0.75:
+                    add("long_short_ratio", 8, "空头占优过深，存在反向挤空可能")
+        except Exception:
+            pass
+
+        try:
+            if volume_change is not None and change_24h is not None:
+                vol = float(volume_change)
+                chg = float(change_24h)
+                if vol > 15 and chg > 0:
+                    add("volume_price", 10, "放量上涨，趋势确认度提升")
+                elif vol > 15 and chg < 0:
+                    add("volume_price", -10, "放量下跌，空头主导增强")
+                elif vol < -15 and abs(chg) > 3:
+                    add("volume_price", -6 if chg > 0 else 6, "价格波动与成交回落背离，趋势持续性存疑")
+        except Exception:
+            pass
+
+        squeeze_risk = ((crypto_factors.get("signals") or {}).get("squeeze_risk") or "").lower()
+        if squeeze_risk == "high":
+            add("squeeze_risk", -8, "衍生品拥挤度高，短线波动放大风险上升")
+        elif squeeze_risk == "medium":
+            add("squeeze_risk", -3, "衍生品拥挤度抬升，需要控制追涨杀跌")
+
+        summary = crypto_factors.get("summary") or ""
+        return {
+            "score": max(-100.0, min(100.0, score)),
+            "breakdown": breakdown,
+            "summary": summary,
+        }
     
     def _calculate_sentiment_score(self, news: List[Dict]) -> float:
         """
@@ -2468,103 +2760,6 @@ IMPORTANT:
             logger.warning(f"Failed to save analysis task: {e}")
             return None
     
-    # ==================== Backward Compatibility ====================
-    
-    def analyze_legacy_format(self, market: str, symbol: str, language: str = 'en-US',
-                              model: str = None, timeframe: str = "1D") -> Dict[str, Any]:
-        """
-        Returns analysis in legacy multi-agent format for backward compatibility.
-        """
-        fast_result = self.analyze(market, symbol, language, model, timeframe)
-        
-        if fast_result.get("error"):
-            return {
-                "overview": {"report": f"Analysis failed: {fast_result['error']}"},
-                "fundamental": {"report": "N/A"},
-                "technical": {"report": "N/A"},
-                "news": {"report": "N/A"},
-                "sentiment": {"report": "N/A"},
-                "risk": {"report": "N/A"},
-                "error": fast_result["error"],
-            }
-        
-        # Convert to legacy format
-        decision = fast_result.get("decision", "HOLD")
-        confidence = fast_result.get("confidence", 50)
-        scores = fast_result.get("scores", {})
-        to_sum = (fast_result.get("trend_outlook_summary") or "").strip()
-        overview_report = fast_result.get("summary", "") or ""
-        if to_sum:
-            overview_report = f"{overview_report}\n\n【周期预判】{to_sum}" if overview_report.strip() else f"【周期预判】{to_sum}"
-
-        return {
-            "overview": {
-                "overallScore": scores.get("overall", 50),
-                "recommendation": decision,
-                "confidence": confidence,
-                "dimensionScores": {
-                    "fundamental": scores.get("fundamental", 50),
-                    "technical": scores.get("technical", 50),
-                    "news": scores.get("sentiment", 50),
-                    "sentiment": scores.get("sentiment", 50),
-                    "risk": 100 - confidence,  # Inverse of confidence
-                },
-                "report": overview_report,
-            },
-            "fundamental": {
-                "score": scores.get("fundamental", 50),
-                "report": f"Fundamental score: {scores.get('fundamental', 50)}/100",
-            },
-            "technical": {
-                "score": scores.get("technical", 50),
-                "report": f"Technical score: {scores.get('technical', 50)}/100",
-                "indicators": fast_result.get("indicators", {}),
-            },
-            "news": {
-                "score": scores.get("sentiment", 50),
-                "report": "See sentiment analysis",
-            },
-            "sentiment": {
-                "score": scores.get("sentiment", 50),
-                "report": f"Sentiment score: {scores.get('sentiment', 50)}/100",
-            },
-            "risk": {
-                "score": 100 - confidence,
-                "report": "\n".join(fast_result.get("risks", [])),
-            },
-            "debate": {
-                "bull": {"confidence": confidence if decision == "BUY" else 50},
-                "bear": {"confidence": confidence if decision == "SELL" else 50},
-                "research_decision": fast_result.get("summary", ""),
-            },
-            "trader_decision": {
-                "decision": decision,
-                "confidence": confidence,
-                "reasoning": fast_result.get("summary", ""),
-                "trading_plan": fast_result.get("trading_plan", {}),
-                "report": "\n".join(fast_result.get("reasons", [])),
-            },
-            "risk_debate": {
-                "risky": {"recommendation": ""},
-                "neutral": {"recommendation": fast_result.get("summary", "")},
-                "safe": {"recommendation": ""},
-            },
-            "final_decision": {
-                "decision": decision,
-                "confidence": confidence,
-                "reasoning": fast_result.get("summary", ""),
-                "risk_summary": {
-                    "risks": fast_result.get("risks", []),
-                },
-                "recommendation": "\n".join(fast_result.get("reasons", [])),
-            },
-            "fast_analysis": fast_result,  # Include new format for gradual migration
-            "trend_outlook": fast_result.get("trend_outlook"),
-            "trend_outlook_summary": fast_result.get("trend_outlook_summary"),
-            "error": None,
-        }
-
-
 # Singleton instance
 _fast_analysis_service = None
 

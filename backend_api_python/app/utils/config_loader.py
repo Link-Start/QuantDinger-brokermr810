@@ -88,7 +88,27 @@ def load_addon_config() -> Dict[str, Any]:
         ('GROK_API_KEY', 'grok.api_key', 'string'),
         ('GROK_BASE_URL', 'grok.base_url', 'string'),
         ('GROK_MODEL', 'grok.model', 'string'),
-        
+
+        # AtlasCloud
+        ('ATLASCLOUD_API_KEY', 'atlascloud.api_key', 'string'),
+        ('ATLASCLOUD_BASE_URL', 'atlascloud.base_url', 'string'),
+        ('ATLASCLOUD_MODEL', 'atlascloud.model', 'string'),
+
+        # Custom OpenAI-compatible endpoint (see LLMProvider.CUSTOM)
+        ('CUSTOM_API_KEY', 'custom.api_key', 'string'),
+        ('CUSTOM_API_URL', 'custom.base_url', 'string'),
+        ('CUSTOM_MODEL', 'custom.model', 'string'),
+
+        # MiniMax
+        ('MINIMAX_API_KEY', 'minimax.api_key', 'string'),
+        ('MINIMAX_BASE_URL', 'minimax.base_url', 'string'),
+        ('MINIMAX_MODEL', 'minimax.model', 'string'),
+
+        # LiteLLM
+        ('LITELLM_API_KEY', 'litellm.api_key', 'string'),
+        ('LITELLM_BASE_URL', 'litellm.base_url', 'string'),
+        ('LITELLM_MODEL', 'litellm.model', 'string'),
+
         # LLM Provider Selection
         ('LLM_PROVIDER', 'llm.provider', 'string'),
 
@@ -107,6 +127,10 @@ def load_addon_config() -> Dict[str, Any]:
         ('FINNHUB_TIMEOUT', 'finnhub.timeout', 'int'),
         ('FINNHUB_RATE_LIMIT', 'finnhub.rate_limit', 'int'),
 
+        # Crypto analytics
+        ('COINGLASS_API_KEY', 'coinglass.api_key', 'string'),
+        ('CRYPTOQUANT_API_KEY', 'cryptoquant.api_key', 'string'),
+
         # CCXT
         ('CCXT_DEFAULT_EXCHANGE', 'ccxt.default_exchange', 'string'),
         ('CCXT_TIMEOUT', 'ccxt.timeout', 'int'),
@@ -116,6 +140,7 @@ def load_addon_config() -> Dict[str, Any]:
         ('AKSHARE_TIMEOUT', 'akshare.timeout', 'int'),
         ('TIINGO_API_KEY', 'tiingo.api_key', 'string'),
         ('TIINGO_TIMEOUT', 'tiingo.timeout', 'int'),
+        ('TWELVE_DATA_API_KEY', 'twelve_data.api_key', 'string'),
 
         # Search (Google CSE / Bing)
         ('SEARCH_PROVIDER', 'search.provider', 'string'),

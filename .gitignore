@@ -1,20 +1,20 @@
 # ============================================
 # QuantDinger - Open Source Repository
-# Frontend is closed-source, only dist/ is tracked.
 # ============================================
 
 # ========================
-# Frontend Source (CLOSED SOURCE - NOT tracked)
+# Frontend
 # ========================
+# Frontend source lives in the private QuantDinger-Vue repo. The published
+# `ghcr.io/<owner>/quantdinger-frontend` image is consumed via docker-compose
+# by default. For local source iteration, clone QuantDinger-Vue into the
+# `/QuantDinger-Vue/` slot below and run `docker compose up --build` — that
+# path is referenced by docker-compose.yml's frontend `build.context`
+# directive. Nothing under these paths should ever be committed here.
 /quantdinger_vue/
 /QuantDinger-Vue-src/
-
-# ========================
-# Frontend dist - DO track (pre-built)
-# ========================
-!/frontend/
-!/frontend/dist/
-!/frontend/dist/**
+/QuantDinger-Vue/
+/frontend/
 
 # ========================
 # Environment & Secrets
@@ -29,6 +29,7 @@ backend_api_python/.env
 # ========================
 .idea/
 .vscode/
+agent-tools/
 *.swp
 *.swo
 *~
@@ -43,7 +44,6 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.egg-info/
-# Only ignore root-level dist/, not frontend/dist/
 /dist/
 build/
 *.egg
@@ -67,8 +67,21 @@ yarn.lock
 # ========================
 *.log
 backend_api_python/logs/
+backend_api_python/dist/
+
+# MCP server build artifacts (PyPI release output, never committed)
+mcp_server/dist/
+mcp_server/build/
+mcp_server/.smoketest/
+mcp_server/src/quantdinger_mcp.egg-info/
 backend_api_python/data/quantdinger.db
 backend_api_python/data/memory/
+
+# ========================
+# i18n tooling
+# ========================
+scripts/.i18n-cache/
+QuantDinger-Vue-src/src/locales/lang/*.bak
 
 # ========================
 # Docker

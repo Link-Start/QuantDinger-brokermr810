@@ -2,14 +2,18 @@
 Factory for direct exchange clients.
 
 Supports:
-- Crypto exchanges: Binance, OKX, Bitget, Bybit, Coinbase, Kraken, KuCoin, Gate, Bitfinex, Deepcoin, HTX
+- Crypto exchanges: Binance, OKX, Bitget, Bybit, Coinbase, Kraken, Gate, HTX
 - Traditional brokers: Interactive Brokers (IBKR) for US stocks
 - Forex brokers: MetaTrader 5 (MT5)
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, Union
+import logging
+import os
+from typing import Any, Dict, Optional, Union
+
+logger = logging.getLogger(__name__)
 
 from app.services.live_trading.base import BaseRestClient, LiveTradingError
 from app.services.live_trading.binance import BinanceFuturesClient
@@ -21,10 +25,7 @@ from app.services.live_trading.bybit import BybitClient
 from app.services.live_trading.coinbase_exchange import CoinbaseExchangeClient
 from app.services.live_trading.kraken import KrakenClient
 from app.services.live_trading.kraken_futures import KrakenFuturesClient
-from app.services.live_trading.kucoin import KucoinSpotClient, KucoinFuturesClient
 from app.services.live_trading.gate import GateSpotClient, GateUsdtFuturesClient
-from app.services.live_trading.bitfinex import BitfinexClient, BitfinexDerivativesClient
-from app.services.live_trading.deepcoin import DeepcoinClient
 from app.services.live_trading.htx import HtxClient
 
 # Lazy import IBKR to avoid ImportError if ib_insync not installed
@@ -34,6 +35,10 @@ IBKRConfig = None
 # Lazy import MT5 to avoid ImportError if MetaTrader5 not installed
 MT5Client = None
 MT5Config = None
+
+# Lazy import Alpaca to avoid ImportError if alpaca-py not installed
+AlpacaClient = None
+AlpacaConfig = None
 
 
 def _get(cfg: Dict[str, Any], *keys: str) -> str:
@@ -47,11 +52,81 @@ def _get(cfg: Dict[str, Any], *keys: str) -> str:
     return ""
 
 
+# Merged from HTTP JSON root into nested `exchange_config` for /strategies/test-connection
+# when the UI sends demo/testnet toggles next to the nested object.
+EXCHANGE_CONFIG_ROOT_OVERLAY_KEYS = (
+    "enable_demo_trading",
+    "enableDemoTrading",
+    "simulated_trading",
+    "simulatedTrading",
+    "use_testnet",
+    "is_testnet",
+    "isTestnet",
+    "sandbox",
+    "paper_trading",
+    "paperTrading",
+    "network",
+    "environment",
+    "env",
+    "base_url",
+    "baseUrl",
+    "futures_base_url",
+    "futuresBaseUrl",
+)
+
+
+def merge_root_exchange_config_overlay(*, root: Dict[str, Any], exchange_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Overlay selected keys from the request root onto exchange_config (copying the latter)."""
+    out = dict(exchange_config or {})
+    if not isinstance(root, dict):
+        return out
+    for k in EXCHANGE_CONFIG_ROOT_OVERLAY_KEYS:
+        if k in root:
+            out[k] = root[k]
+    return out
+
+
+def exchange_demo_mode_enabled(cfg: Dict[str, Any]) -> bool:
+    """
+    Whether config indicates demo / testnet / simulated / paper mode for live-trading clients.
+
+    Accepts common frontend / exchange naming variants so test-connection matches create_client.
+    """
+    if not isinstance(cfg, dict):
+        return False
+    env = str(cfg.get("network") or cfg.get("environment") or cfg.get("env") or "").strip().lower()
+    if env in ("testnet", "sandbox", "demo", "paper", "simulate", "simulation"):
+        return True
+    for k in (
+        "enable_demo_trading",
+        "enableDemoTrading",
+        "simulated_trading",
+        "simulatedTrading",
+        "use_testnet",
+        "is_testnet",
+        "isTestnet",
+        "sandbox",
+        "paper_trading",
+        "paperTrading",
+        # Alpaca stores its paper/live flag as a bare `paper` boolean — alias it
+        # so /api/credentials/list shows the right paper badge on Alpaca rows.
+        "paper",
+        "is_paper",
+    ):
+        v = cfg.get(k)
+        if v is None:
+            continue
+        if isinstance(v, bool) and v:
+            return True
+        if isinstance(v, (int, float)) and int(v) == 1:
+            return True
+        if isinstance(v, str) and str(v).strip().lower() in ("true", "1", "yes", "on"):
+            return True
+    return False
+
+
 def _demo_enabled(cfg: Dict[str, Any]) -> bool:
-    v = cfg.get("enable_demo_trading") or cfg.get("enableDemoTrading")
-    if isinstance(v, bool):
-        return v
-    return str(v or "").strip().lower() in ("true", "1", "yes")
+    return exchange_demo_mode_enabled(cfg)
 
 
 def create_client(exchange_config: Dict[str, Any], *, market_type: str = "swap") -> BaseRestClient:
@@ -72,11 +147,13 @@ def create_client(exchange_config: Dict[str, Any], *, market_type: str = "swap")
         spot_broker_id = _get(exchange_config, "spot_broker_id", "spotBrokerId", "broker_id", "brokerId") or "A2NAPZAC"
         futures_broker_id = _get(exchange_config, "futures_broker_id", "futuresBrokerId", "broker_id", "brokerId") or "HBpUbQjT"
         if mt == "spot":
-            default_url = "https://demo-api.binance.com" if is_demo else "https://api.binance.com"
+            # Binance Spot Testnet: https://testnet.binance.vision (official)
+            default_url = "https://testnet.binance.vision" if is_demo else "https://api.binance.com"
             base_url = _get(exchange_config, "base_url", "baseUrl") or default_url
             return BinanceSpotClient(api_key=api_key, secret_key=secret_key, base_url=base_url, enable_demo_trading=is_demo, broker_id=spot_broker_id)
         # Default to USDT-M futures
-        default_url = "https://demo-fapi.binance.com" if is_demo else "https://fapi.binance.com"
+        # Binance Futures Testnet: https://testnet.binancefuture.com (official)
+        default_url = "https://testnet.binancefuture.com" if is_demo else "https://fapi.binance.com"
         base_url = _get(exchange_config, "base_url", "baseUrl") or default_url
         return BinanceFuturesClient(api_key=api_key, secret_key=secret_key, base_url=base_url, enable_demo_trading=is_demo, broker_id=futures_broker_id)
     if exchange_id == "okx":
@@ -117,7 +194,7 @@ def create_client(exchange_config: Dict[str, Any], *, market_type: str = "swap")
         default_bybit = "https://api-testnet.bybit.com" if is_demo else "https://api.bybit.com"
         base_url = _get(exchange_config, "base_url", "baseUrl") or default_bybit
         category = "spot" if mt == "spot" else "linear"
-        recv_window_ms = int(exchange_config.get("recv_window_ms") or exchange_config.get("recvWindow") or 5000)
+        recv_window_ms = int(exchange_config.get("recv_window_ms") or exchange_config.get("recvWindow") or 12000)
         broker_referer = _get(exchange_config, "bybit_referer", "broker_referer", "brokerReferer") or "Ri001020"
         hedge_mode_raw = exchange_config.get("hedge_mode")
         if hedge_mode_raw is None:
@@ -155,15 +232,6 @@ def create_client(exchange_config: Dict[str, Any], *, market_type: str = "swap")
         fut_url = _get(exchange_config, "futures_base_url", "futuresBaseUrl") or fut_default
         return KrakenFuturesClient(api_key=api_key, secret_key=secret_key, base_url=fut_url)
 
-    if exchange_id == "kucoin":
-        default_spot = "https://openapi-sandbox.kucoin.com" if is_demo else "https://api.kucoin.com"
-        base_url = _get(exchange_config, "base_url", "baseUrl") or default_spot
-        if mt == "spot":
-            return KucoinSpotClient(api_key=api_key, secret_key=secret_key, passphrase=passphrase, base_url=base_url)
-        fut_default = "https://api-sandbox-futures.kucoin.com" if is_demo else "https://api-futures.kucoin.com"
-        fut_url = _get(exchange_config, "futures_base_url", "futuresBaseUrl") or fut_default
-        return KucoinFuturesClient(api_key=api_key, secret_key=secret_key, passphrase=passphrase, base_url=fut_url)
-
     if exchange_id == "gate":
         gate_channel_id = _get(exchange_config, "gate_channel_id", "gateChannelId") or "dinger"
         if mt == "spot":
@@ -174,29 +242,10 @@ def create_client(exchange_config: Dict[str, Any], *, market_type: str = "swap")
         base_url = _get(exchange_config, "base_url", "baseUrl") or default_fut
         return GateUsdtFuturesClient(api_key=api_key, secret_key=secret_key, base_url=base_url, channel_id=gate_channel_id)
 
-    if exchange_id == "bitfinex":
-        # Same REST host; use keys from Bitfinex paper/sub-account where applicable.
-        base_url = _get(exchange_config, "base_url", "baseUrl") or "https://api.bitfinex.com"
-        if mt == "spot":
-            return BitfinexClient(api_key=api_key, secret_key=secret_key, base_url=base_url)
-        return BitfinexDerivativesClient(api_key=api_key, secret_key=secret_key, base_url=base_url)
-
-    if exchange_id == "deepcoin":
-        if is_demo and not (_get(exchange_config, "base_url", "baseUrl")):
-            raise LiveTradingError("Deepcoin demo/testnet is not configured in this project yet. Please disable demo mode or provide an explicit testnet base_url.")
-        base_url = _get(exchange_config, "base_url", "baseUrl") or "https://api.deepcoin.com"
-        return DeepcoinClient(
-            api_key=api_key,
-            secret_key=secret_key,
-            passphrase=passphrase,
-            base_url=base_url,
-            market_type=mt,
-        )
-
     if exchange_id == "htx":
         if is_demo and not (_get(exchange_config, "base_url", "baseUrl") or _get(exchange_config, "futures_base_url", "futuresBaseUrl")):
             raise LiveTradingError("HTX demo/testnet is not configured in this project yet. Please disable demo mode or provide explicit testnet base_url/futures_base_url.")
-        spot_url = _get(exchange_config, "base_url", "baseUrl") or "https://api.huobi.pro"
+        spot_url = _get(exchange_config, "base_url", "baseUrl") or "https://api.htx.com"
         futures_url = _get(exchange_config, "futures_base_url", "futuresBaseUrl") or "https://api.hbdm.com"
         broker_id = _get(exchange_config, "broker_id", "brokerId") or "AA7b890547"
         return HtxClient(
@@ -220,6 +269,11 @@ def create_client(exchange_config: Dict[str, Any], *, market_type: str = "swap")
         # This factory only creates clients based on exchange_id
         return create_mt5_client(exchange_config)
 
+    # Alpaca: REST broker for US stocks + crypto (no local terminal needed).
+    # Caller is responsible for validating market_category in (USStock, Crypto).
+    if exchange_id == "alpaca":
+        return create_alpaca_client(exchange_config)
+
     raise LiveTradingError(f"Unsupported exchange_id: {exchange_id}")
 
 
@@ -229,9 +283,14 @@ def create_ibkr_client(exchange_config: Dict[str, Any]):
 
     exchange_config should contain:
     - ibkr_host: TWS/Gateway host (default: 127.0.0.1)
-    - ibkr_port: TWS/Gateway port (default: 7497)
-    - ibkr_client_id: Client ID (default: 1)
+    - ibkr_port: TWS/Gateway port (default: 7497 = TWS Paper; TWS Live default is 7496)
+    - ibkr_client_id: Client ID (see below — must not collide with /api/ibkr UI)
     - ibkr_account: Account ID (optional, auto-select if empty)
+
+    TWS allows one TCP session per clientId. The admin UI ``POST /api/ibkr/connect``
+    defaults to clientId=1; live orders therefore default to ``IBKR_ORDER_CLIENT_ID``
+    (7) when credentials omit ibkr_client_id, so manual testing does not evict the worker
+    (and vice versa).
     """
     global IBKRClient, IBKRConfig
 
@@ -246,8 +305,22 @@ def create_ibkr_client(exchange_config: Dict[str, Any]):
 
     host = str(exchange_config.get("ibkr_host") or "127.0.0.1").strip()
     port = int(exchange_config.get("ibkr_port") or 7497)
-    client_id = int(exchange_config.get("ibkr_client_id") or 1)
+    default_order_cid = int(os.getenv("IBKR_ORDER_CLIENT_ID", "7"))
+    _cid_raw = exchange_config.get("ibkr_client_id")
+    if _cid_raw is None or (isinstance(_cid_raw, str) and not str(_cid_raw).strip()):
+        client_id = default_order_cid
+    else:
+        try:
+            client_id = int(_cid_raw)
+        except (TypeError, ValueError):
+            client_id = default_order_cid
     account = str(exchange_config.get("ibkr_account") or "").strip()
+
+    if client_id == 1:
+        logger.warning(
+            "IBKR strategy/order client uses clientId=1 — same default as POST /api/ibkr/connect; "
+            "TWS will drop the other session. Prefer ibkr_client_id=7 or IBKR_ORDER_CLIENT_ID."
+        )
 
     config = IBKRConfig(
         host=host,
@@ -338,5 +411,82 @@ def create_mt5_client(exchange_config: Dict[str, Any]):
         )
 
     return client
+
+
+def create_alpaca_client(exchange_config: Dict[str, Any]):
+    """
+    Create Alpaca client for US stock + crypto trading.
+
+    exchange_config should contain:
+    - api_key:    Alpaca API key (PK*=paper, AK*=live)
+    - secret_key: Alpaca API secret
+    - paper:      Boolean (default True). 'true'/'false' strings also accepted.
+    - base_url:   Optional explicit URL override (otherwise paper/live decides)
+
+    Unlike IBKR/MT5, Alpaca is stateless REST — no terminal/gateway needed,
+    so it's the recommended USStock broker on cloud / SaaS deployments where
+    ALLOW_LOCAL_DESKTOP_BROKERS is false.
+    """
+    global AlpacaClient, AlpacaConfig
+
+    if AlpacaClient is None or AlpacaConfig is None:
+        try:
+            from app.services.alpaca_trading import AlpacaClient as _AlpacaClient, AlpacaConfig as _AlpacaConfig
+            AlpacaClient = _AlpacaClient
+            AlpacaConfig = _AlpacaConfig
+        except ImportError:
+            raise LiveTradingError("Alpaca trading requires alpaca-py. Run: pip install alpaca-py")
+
+    api_key = (_get(exchange_config, "api_key", "apiKey") or "").strip()
+    secret_key = (_get(exchange_config, "secret_key", "secret", "secretKey") or "").strip()
+    if not api_key or not secret_key:
+        raise LiveTradingError("Alpaca requires api_key and secret_key")
+
+    # Paper mode: explicit flag wins; otherwise infer from key prefix (PK = paper).
+    paper_raw = exchange_config.get("paper")
+    if paper_raw is None:
+        paper_raw = exchange_config.get("is_paper")
+    if isinstance(paper_raw, bool):
+        paper = paper_raw
+    elif isinstance(paper_raw, str) and paper_raw.strip():
+        paper = paper_raw.strip().lower() in ("1", "true", "yes", "on", "paper")
+    else:
+        paper = api_key.upper().startswith("PK")
+
+    base_url = _get(exchange_config, "base_url", "baseUrl") or None
+
+    config = AlpacaConfig(
+        api_key=api_key,
+        secret_key=secret_key,
+        paper=paper,
+        base_url=base_url,
+    )
+
+    client = AlpacaClient(config)
+    if not client.connect():
+        raise LiveTradingError(
+            "Failed to connect to Alpaca (REST trading API). Check api_key/secret, "
+            "paper/live (PK*=paper, AK*=live), and network access. "
+            "HTTP 400 'invalid syntax' on market-data WebSocket is usually a bad "
+            "auth/subscribe JSON or symbol (use BTC/USD not BTC/USDT for crypto)."
+        )
+    return client
+
+
+def query_fee_rate(
+    exchange_config: Dict[str, Any],
+    symbol: str,
+    market_type: str = "swap",
+) -> Optional[Dict[str, float]]:
+    """
+    Best-effort: create a temporary client and query the account's fee tier
+    for the given symbol.  Returns {"maker": 0.0002, "taker": 0.0005} or None.
+    """
+    try:
+        client = create_client(exchange_config, market_type=market_type)
+        return client.get_fee_rate(symbol, market_type=market_type)
+    except Exception as e:
+        logger.debug(f"query_fee_rate failed for {symbol}: {e}")
+        return None
 
 

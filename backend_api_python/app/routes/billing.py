@@ -1,12 +1,13 @@
 """
-Billing APIs - 会员购买/套餐配置（Mock支付）
+Billing APIs — membership plans and USDT on-chain payments.
 
-当前版本先实现“快速商业闭环”的最小可用：
-- 从系统设置(.env)读取 3 档会员（包月/包年/永久）金额与赠送积分配置
-- 用户在前端购买后立即开通/发放积分（后续可替换为真实支付网关）
+Plan amounts and credits are read from system settings (.env).
+Membership activation is triggered only after USDT payment confirmation
+(see usdt_payment_service).
 """
 
-from flask import Blueprint, jsonify, request, g
+from flask import g, jsonify, request
+from app.openapi.blueprint import HumanBlueprint as Blueprint
 
 from app.utils.auth import login_required
 from app.utils.logger import get_logger
@@ -15,10 +16,10 @@ from app.services.usdt_payment_service import get_usdt_payment_service
 
 logger = get_logger(__name__)
 
-billing_bp = Blueprint("billing", __name__)
+billing_blp = Blueprint("billing", __name__)
 
 
-@billing_bp.route("/plans", methods=["GET"])
+@billing_blp.route("/plans", methods=["GET"])
 @login_required
 def get_membership_plans():
     """Get membership plan configuration + current user's billing snapshot."""
@@ -33,53 +34,47 @@ def get_membership_plans():
         return jsonify({"code": 0, "msg": str(e), "data": None}), 500
 
 
-@billing_bp.route("/purchase", methods=["POST"])
-@login_required
-def purchase_membership():
-    """
-    Purchase membership (mock: immediate activation).
+# =========================
+# USDT Pay
+# =========================
 
-    Body:
-      { plan: "monthly" | "yearly" | "lifetime" }
+
+@billing_blp.route("/usdt/chains", methods=["GET"])
+@login_required
+def usdt_list_chains():
+    """List USDT chains that are enabled AND have a receiving address
+    configured. Chains without an address are auto-hidden by the backend
+    so the frontend chain picker can render the response verbatim.
     """
     try:
-        user_id = getattr(g, "user_id", None)
-        data = request.get_json() or {}
-        plan = (data.get("plan") or "").strip().lower()
-        if not plan:
-            return jsonify({"code": 0, "msg": "missing_plan", "data": None}), 400
-
-        success, msg, out = get_billing_service().purchase_membership(user_id, plan)
-        if success:
-            return jsonify({"code": 1, "msg": msg, "data": out})
-        return jsonify({"code": 0, "msg": msg, "data": out}), 400
+        chains = get_usdt_payment_service().list_chains()
+        return jsonify({"code": 1, "msg": "success", "data": {"chains": chains}})
     except Exception as e:
-        logger.error(f"purchase_membership failed: {e}", exc_info=True)
+        logger.error(f"usdt_list_chains failed: {e}", exc_info=True)
         return jsonify({"code": 0, "msg": str(e), "data": None}), 500
 
 
-# =========================
-# USDT Pay (方案B)
-# =========================
-
-
-@billing_bp.route("/usdt/create", methods=["POST"])
+@billing_blp.route("/usdt/create", methods=["POST"])
 @login_required
 def usdt_create_order():
-    """
-    Create USDT order for membership plan (per-order address).
+    """Create a USDT membership order.
 
     Body:
-      { plan: "monthly"|"yearly"|"lifetime" }
+      {
+        plan:  "monthly" | "yearly" | "lifetime",
+        chain: "TRC20" | "BEP20" | "ERC20" | "SOL"   # optional; defaults to
+                                                     # the first enabled chain
+      }
     """
     try:
         user_id = getattr(g, "user_id", None)
         data = request.get_json() or {}
         plan = (data.get("plan") or "").strip().lower()
+        chain = (data.get("chain") or "").strip().upper() or None
         if not plan:
             return jsonify({"code": 0, "msg": "missing_plan", "data": None}), 400
 
-        ok, msg, out = get_usdt_payment_service().create_order(user_id, plan)
+        ok, msg, out = get_usdt_payment_service().create_order(user_id, plan, chain=chain)
         if ok:
             return jsonify({"code": 1, "msg": "success", "data": out})
         return jsonify({"code": 0, "msg": msg, "data": out}), 400
@@ -88,7 +83,7 @@ def usdt_create_order():
         return jsonify({"code": 0, "msg": str(e), "data": None}), 500
 
 
-@billing_bp.route("/usdt/order/<int:order_id>", methods=["GET"])
+@billing_blp.route("/usdt/order/<int:order_id>", methods=["GET"])
 @login_required
 def usdt_get_order(order_id: int):
     """Get my USDT order; refresh chain status by default."""
@@ -103,3 +98,6 @@ def usdt_get_order(order_id: int):
         logger.error(f"usdt_get_order failed: {e}", exc_info=True)
         return jsonify({"code": 0, "msg": str(e), "data": None}), 500
 
+
+# openapi-compat: legacy import name
+billing_bp = billing_blp

@@ -6,7 +6,8 @@ encrypted_config stores Fernet ciphertext derived from SECRET_KEY (see app.utils
 
 import traceback
 import json
-from flask import Blueprint, request, jsonify, g
+from flask import g, jsonify, request
+from app.openapi.blueprint import HumanBlueprint as Blueprint
 
 import requests as rq
 
@@ -14,10 +15,34 @@ from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
 from app.utils.auth import login_required
 from app.utils.credential_crypto import encrypt_credential_blob, decrypt_credential_blob
+from app.services.live_trading.factory import exchange_demo_mode_enabled
+from app.services.live_trading.capabilities import supported_crypto_exchange_ids
 
 logger = get_logger(__name__)
 
-credentials_bp = Blueprint('credentials', __name__)
+credentials_blp = Blueprint('credentials', __name__)
+
+
+@credentials_blp.route('/desktop-brokers-policy', methods=['GET'])
+@login_required
+def desktop_brokers_policy():
+    """
+    Whether IBKR / MT5 (local TWS or MT5 terminal) may be configured on this deployment.
+    Frontend uses this to disable options and show guidance before save/test.
+    """
+    from app.utils.local_brokers import desktop_broker_cloud_reject_message, local_desktop_brokers_allowed
+
+    allowed = local_desktop_brokers_allowed()
+    return jsonify(
+        {
+            'code': 1,
+            'msg': 'success',
+            'data': {
+                'allow_local_desktop_brokers': allowed,
+                'disabled_message': None if allowed else desktop_broker_cloud_reject_message(),
+            },
+        }
+    )
 
 
 def _api_key_hint(api_key: str) -> str:
@@ -29,7 +54,7 @@ def _api_key_hint(api_key: str) -> str:
     return f"{s[:4]}...{s[-4:]}"
 
 
-@credentials_bp.route('/list', methods=['GET'])
+@credentials_blp.route('/list', methods=['GET'])
 @login_required
 def list_credentials():
     """List all credentials for the current user."""
@@ -57,7 +82,7 @@ def list_credentials():
             try:
                 plain = decrypt_credential_blob(item.get('encrypted_config'))
                 cfg = json.loads(plain) if plain else {}
-                item['enable_demo_trading'] = bool(cfg.get('enable_demo_trading') or cfg.get('enableDemoTrading'))
+                item['enable_demo_trading'] = exchange_demo_mode_enabled(cfg if isinstance(cfg, dict) else {})
             except Exception:
                 item['enable_demo_trading'] = False
             item.pop('encrypted_config', None)
@@ -70,10 +95,7 @@ def list_credentials():
         return jsonify({'code': 0, 'msg': str(e), 'data': {'items': []}}), 500
 
 
-CRYPTO_EXCHANGES = [
-    'binance', 'okx', 'bitget', 'bybit', 'coinbaseexchange',
-    'kraken', 'kucoin', 'gate', 'bitfinex', 'deepcoin', 'htx'
-]
+CRYPTO_EXCHANGES = sorted(supported_crypto_exchange_ids(include_aliases=True))
 
 
 def _egress_ipify(url: str) -> str:
@@ -89,7 +111,7 @@ def _egress_ipify(url: str) -> str:
         return ""
 
 
-@credentials_bp.route('/egress-ip', methods=['GET'])
+@credentials_blp.route('/egress-ip', methods=['GET'])
 @login_required
 def get_egress_ip():
     """
@@ -112,7 +134,7 @@ def get_egress_ip():
     )
 
 
-@credentials_bp.route('/create', methods=['POST'])
+@credentials_blp.route('/create', methods=['POST'])
 @login_required
 def create_credential():
     """Create a new credential for the current user.
@@ -128,15 +150,49 @@ def create_credential():
         if not exchange_id:
             return jsonify({'code': 0, 'msg': 'Missing exchange_id', 'data': None}), 400
 
+        if exchange_id in ('ibkr', 'mt5'):
+            from app.utils.local_brokers import desktop_broker_cloud_reject_message, local_desktop_brokers_allowed
+
+            if not local_desktop_brokers_allowed():
+                return jsonify({'code': 0, 'msg': desktop_broker_cloud_reject_message(), 'data': None}), 403
+
         config = {'exchange_id': exchange_id}
         hint = ''
 
-        if exchange_id == 'ibkr':
+        if exchange_id == 'alpaca':
+            # Alpaca: REST-only broker (no local terminal). Paper/live is decided
+            # by the API key prefix at runtime — PK* hits paper-api.alpaca.markets,
+            # AK* hits api.alpaca.markets. We deliberately do NOT expose a paper
+            # toggle in the UI: the user provides whichever key matches the env
+            # they want to trade in, and factory.create_alpaca_client routes
+            # automatically. base_url is still accepted as an explicit override
+            # (rare — only useful behind a corporate proxy or for unit tests).
+            api_key = (data.get('api_key') or data.get('apiKey') or '').strip()
+            secret_key = (data.get('secret_key') or data.get('secretKey') or '').strip()
+            if not api_key or not secret_key:
+                return jsonify({'code': 0, 'msg': 'Missing api_key/secret_key', 'data': None}), 400
+
+            config.update({
+                'api_key': api_key,
+                'secret_key': secret_key,
+                'base_url': (data.get('base_url') or data.get('baseUrl') or '').strip(),
+            })
+            # Surface the inferred env in the hint so the credential list still
+            # tells users at a glance whether this key targets paper or live.
+            env_tag = 'paper' if api_key.upper().startswith('PK') else 'live'
+            hint = f"{_api_key_hint(api_key)} ({env_tag})"
+        elif exchange_id == 'ibkr':
             # Interactive Brokers (US stocks)
+            # clientId must differ from manual /api/ibkr/connect (defaults to 1) or TWS drops one session.
+            _ib_cid = data.get('ibkr_client_id')
+            try:
+                ibkr_client_id = int(_ib_cid) if _ib_cid not in (None, '') else 7
+            except (TypeError, ValueError):
+                ibkr_client_id = 7
             config.update({
                 'ibkr_host': (data.get('ibkr_host') or '127.0.0.1').strip(),
                 'ibkr_port': int(data.get('ibkr_port') or 7497),
-                'ibkr_client_id': int(data.get('ibkr_client_id') or 1),
+                'ibkr_client_id': ibkr_client_id,
                 'ibkr_account': (data.get('ibkr_account') or '').strip()
             })
             hint = f"{config['ibkr_host']}:{config['ibkr_port']}"
@@ -164,7 +220,7 @@ def create_credential():
                 'api_key': api_key,
                 'secret_key': secret_key,
                 'passphrase': (data.get('passphrase') or '').strip(),
-                'enable_demo_trading': bool(data.get('enable_demo_trading', False))
+                'enable_demo_trading': exchange_demo_mode_enabled(data),
             })
             hint = _api_key_hint(api_key)
         else:
@@ -195,7 +251,54 @@ def create_credential():
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
-@credentials_bp.route('/delete', methods=['DELETE'])
+@credentials_blp.route('/update-name', methods=['PUT', 'PATCH'])
+@login_required
+def update_credential_name():
+    """Update display name (alias) only — API keys in encrypted_config are untouched."""
+    try:
+        user_id = g.user_id
+        data = request.get_json() or {}
+        cred_id = data.get('id')
+        if cred_id is None:
+            cred_id = request.args.get('id', type=int)
+        try:
+            cred_id = int(cred_id)
+        except (TypeError, ValueError):
+            cred_id = None
+        if not cred_id:
+            return jsonify({'code': 0, 'msg': 'Missing id', 'data': None}), 400
+
+        name = (data.get('name') or '').strip()
+        if len(name) > 128:
+            return jsonify({'code': 0, 'msg': 'Name too long (max 128 characters)', 'data': None}), 400
+
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                """
+                UPDATE qd_exchange_credentials
+                SET name = %s, updated_at = NOW()
+                WHERE id = %s AND user_id = %s
+                RETURNING id, name, exchange_id, api_key_hint, created_at, updated_at
+                """,
+                (name, cred_id, user_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                cur.close()
+                return jsonify({'code': 0, 'msg': 'Not found', 'data': None}), 404
+            db.commit()
+            cur.close()
+
+        item = dict(row or {})
+        return jsonify({'code': 1, 'msg': 'success', 'data': item})
+    except Exception as e:
+        logger.error(f"update_credential_name failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@credentials_blp.route('/delete', methods=['DELETE'])
 @login_required
 def delete_credential():
     """Delete a credential for the current user."""
@@ -221,7 +324,7 @@ def delete_credential():
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
-@credentials_bp.route('/get', methods=['GET'])
+@credentials_blp.route('/get', methods=['GET'])
 @login_required
 def get_credential():
     """
@@ -272,3 +375,6 @@ def get_credential():
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
+
+# openapi-compat: legacy import name
+credentials_bp = credentials_blp

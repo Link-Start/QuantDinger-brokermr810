@@ -27,57 +27,35 @@ DEFAULT_SECRET="quantdinger-secret-key-change-me"
 CURRENT_SECRET=$(grep -E "^SECRET_KEY=" /app/.env 2>/dev/null | cut -d'=' -f2- | tr -d '"' | tr -d "'" | xargs || echo "")
 
 if [ -z "$CURRENT_SECRET" ]; then
-    echo ""
-    echo "============================================"
-    echo "  [SECURITY WARNING]"
-    echo "============================================"
-    echo "SECRET_KEY is not set in /app/.env"
-    echo ""
-    echo "Please set a secure SECRET_KEY before starting:"
-    echo ""
-    echo "  Option 1: Generate a random key:"
-    echo "    docker exec -it quantdinger-backend python -c \"import secrets; print(secrets.token_hex(32))\""
-    echo ""
-    echo "  Option 2: Edit .env file:"
-    echo "    SECRET_KEY=your-generated-secret-key-here"
-    echo ""
-    echo "Then restart the container:"
-    echo "    docker-compose restart backend"
-    echo ""
-    echo "============================================"
-    exit 1
+    NEW_SECRET=$(python3 -c "import secrets; print(secrets.token_hex(32))")
+    echo "SECRET_KEY=${NEW_SECRET}" >> /app/.env
+    echo "[AUTO] Generated random SECRET_KEY (was missing)."
+    CURRENT_SECRET="$NEW_SECRET"
 fi
 
-# Check if using default secret key
+# Auto-generate SECRET_KEY if using default (zero-config experience)
 if [ "$CURRENT_SECRET" = "$DEFAULT_SECRET" ]; then
-    echo ""
-    echo "============================================"
-    echo "  [SECURITY ERROR]"
-    echo "============================================"
-    echo "SECRET_KEY is using the default example value!"
-    echo "This is INSECURE and MUST be changed before running in production."
-    echo ""
-    echo "Current value: $CURRENT_SECRET"
-    echo ""
-    echo "To fix this:"
-    echo ""
-    echo "  1. Generate a secure random key:"
-    echo "     docker exec -it quantdinger-backend python -c \"import secrets; print(secrets.token_hex(32))\""
-    echo ""
-    echo "  2. Edit backend_api_python/.env and replace SECRET_KEY:"
-    echo "     SECRET_KEY=<generated-key-here>"
-    echo ""
-    echo "  3. Restart the container:"
-    echo "     docker-compose restart backend"
-    echo ""
-    echo "Or use this one-liner (Linux/Mac):"
-    echo "     sed -i 's|SECRET_KEY=.*|SECRET_KEY='\$(python3 -c \"import secrets; print(secrets.token_hex(32))\")\'|' backend_api_python/.env"
-    echo ""
-    echo "============================================"
-    exit 1
+    NEW_SECRET=$(python3 -c "import secrets; print(secrets.token_hex(32))")
+    # Use a temp file + write-back instead of `sed -i`. When /app/.env is a
+    # Docker bind-mount from the host (zero-repo GHCR deploy), `sed -i` fails
+    # with "Device or resource busy" because it tries to rename(2) the inode
+    # over a mount target. Truncate+write through the mount works fine and
+    # propagates the new key back to the host file.
+    TMP=$(mktemp)
+    sed "s|SECRET_KEY=.*|SECRET_KEY=${NEW_SECRET}|" /app/.env > "$TMP"
+    cat "$TMP" > /app/.env
+    rm -f "$TMP"
+    echo "[AUTO] Generated random SECRET_KEY (was default)."
+    echo "[TIP]  For production, set a persistent SECRET_KEY in backend_api_python/.env"
 fi
 
 echo "[OK] SECRET_KEY is configured"
+SECRET_LEN=$(printf '%s' "$CURRENT_SECRET" | wc -c | tr -d ' ')
+if [ "$SECRET_LEN" -lt 32 ]; then
+    echo "[WARNING] SECRET_KEY is only ${SECRET_LEN} bytes; RFC 7518 recommends >= 32 for HS256."
+    echo "          Generate one with: python3 -c \"import secrets; print(secrets.token_hex(32))\""
+    echo "          After updating .env, restart the stack; users must sign in again."
+fi
 echo ""
 
 # Start the application

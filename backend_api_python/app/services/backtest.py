@@ -4,6 +4,9 @@ Backtest Service
 import hashlib
 import json
 import math
+import re
+import threading
+import time as _time
 import traceback
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -15,9 +18,49 @@ import numpy as np
 from app.data_sources import DataSourceFactory
 from app.utils.logger import get_logger
 from app.utils.db import get_db_connection
+from app.utils.risk_guard import trailing_exit_locks_net_profit
 from app.services.indicator_params import IndicatorParamsParser, IndicatorCaller
 
 logger = get_logger(__name__)
+
+
+class _KlineCache:
+    """Simple in-memory K-line cache with TTL to avoid repeated external API calls."""
+
+    def __init__(self, max_size: int = 64):
+        self._store: Dict[str, Any] = {}
+        self._lock = threading.Lock()
+        self._max_size = max_size
+
+    @staticmethod
+    def _ttl_for_timeframe(timeframe: str) -> int:
+        if timeframe in ('1m', '5m', '15m', '30m'):
+            return 300   # 5 min for intraday
+        return 1800      # 30 min for daily+
+
+    def get(self, key: str) -> Optional[pd.DataFrame]:
+        with self._lock:
+            entry = self._store.get(key)
+            if entry is None:
+                return None
+            if _time.time() > entry['expires']:
+                del self._store[key]
+                return None
+            return entry['df'].copy()
+
+    def put(self, key: str, df: pd.DataFrame, timeframe: str):
+        ttl = self._ttl_for_timeframe(timeframe)
+        with self._lock:
+            if len(self._store) >= self._max_size:
+                oldest_key = min(self._store, key=lambda k: self._store[k]['expires'])
+                del self._store[oldest_key]
+            self._store[key] = {
+                'df': df.copy(),
+                'expires': _time.time() + ttl
+            }
+
+
+_kline_cache = _KlineCache()
 
 
 class BacktestService:
@@ -29,20 +72,118 @@ class BacktestService:
         '1H': 3600, '4H': 14400, '1D': 86400, '1W': 604800
     }
     
-    # Multi-timeframe backtest threshold configuration
-    # 1m backtest: max 15 days (~21,600 candles) - reduced for performance
-    # 5m backtest: max 1 year (~105,120 candles)
+    # Multi-timeframe backtest threshold configuration.
+    # We pick the finest execution timeframe whose total candle count stays
+    # within ~25k bars — that's the empirical sweet spot where:
+    #   * CCXT paginated fetches stay under ~90 batches (well within budget),
+    #   * the simulation loop completes in single-digit seconds,
+    #   * the JSON response stays well under the frontend's 10-minute timeout.
+    # If the user's date range exceeds the highest tier, we silently fall back
+    # to a standard single-timeframe backtest (see `run_multi_timeframe`).
     MTF_CONFIG = {
-        'max_1m_days': 15,        # Max days for 1-minute backtest (reduced from 30 for performance)
-        'max_5m_days': 365,       # Max days for 5-minute backtest
-        'default_exec_tf': '1m',  # Default execution timeframe
-        'fallback_exec_tf': '5m', # Fallback execution timeframe
+        'max_1m_days': 15,         # 1m: 15d × 1440 = 21,600 candles
+        'max_5m_days': 90,         # 5m: 90d × 288 = 25,920 candles (~86 CCXT calls)
+        'max_15m_days': 240,       # 15m: 240d × 96 = 23,040 candles (~77 CCXT calls)
+        'max_30m_days': 540,       # 30m: 540d × 48 = 25,920 candles (~86 CCXT calls)
+        'default_exec_tf': '1m',   # Default execution timeframe
+        'fallback_exec_tf': '5m',  # Fallback execution timeframe
     }
 
     ENGINE_VERSION = 'strategy-backtest-v1'
 
     def __init__(self):
         self._storage_schema_ready = False
+
+    def _estimate_warmup_bars(
+        self,
+        indicator_code: str,
+        indicator_params: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """Estimate indicator warmup bars from declared numeric period params."""
+        try:
+            declared = IndicatorParamsParser.parse_params(indicator_code or "")
+            merged = IndicatorParamsParser.merge_params(declared, indicator_params or {})
+        except Exception:
+            merged = {}
+
+        max_period = 0
+        period_name_re = re.compile(
+            r"(len|length|period|window|lookback|ema|sma|rsi|adx|atr|vol|ma)$",
+            re.IGNORECASE,
+        )
+        for key, value in (merged or {}).items():
+            name = str(key or "")
+            try:
+                n = int(float(value))
+            except Exception:
+                continue
+            if n <= 1 or n > 10000:
+                continue
+            if period_name_re.search(name) or name.endswith("_n"):
+                max_period = max(max_period, n)
+
+        if max_period <= 0:
+            return 0
+        return int(min(max_period + max(50, math.ceil(max_period * 0.5)), 2000))
+
+    def _warmup_start_date(self, start_date: datetime, timeframe: str, warmup_bars: int) -> datetime:
+        if warmup_bars <= 0:
+            return start_date
+        tf_seconds = self.TIMEFRAME_SECONDS.get(timeframe, 86400)
+        return start_date - timedelta(seconds=tf_seconds * warmup_bars)
+
+    def _slice_to_backtest_window(
+        self,
+        df: pd.DataFrame,
+        start_date: datetime,
+        end_date: datetime,
+    ) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        rs = pd.Timestamp(start_date)
+        re = pd.Timestamp(end_date)
+        out = df[(df.index >= rs) & (df.index <= re)].copy()
+        if getattr(df, "attrs", None):
+            out.attrs.update(df.attrs)
+        return out
+
+    def _slice_signals_to_window(
+        self,
+        signals: Dict[str, Any],
+        target_index: pd.Index,
+    ) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for key, value in (signals or {}).items():
+            if str(key).startswith("_"):
+                out[key] = value
+                continue
+            if hasattr(value, "reindex"):
+                fill = False
+                try:
+                    if getattr(value, "dtype", None) is not None and not pd.api.types.is_bool_dtype(value):
+                        fill = 0.0
+                except Exception:
+                    fill = False
+                out[key] = value.reindex(target_index, fill_value=fill)
+            else:
+                out[key] = value
+        return out
+
+    def _attach_warmup_to_result(
+        self,
+        result: Dict[str, Any],
+        *,
+        warmup_bars: int,
+        warmup_start: datetime,
+        requested_start: datetime,
+    ) -> None:
+        if warmup_bars <= 0:
+            return
+        ea = dict(result.get("executionAssumptions") or {})
+        ea["indicatorWarmupBars"] = int(warmup_bars)
+        ea["indicatorWarmupStart"] = str(warmup_start)
+        ea["requestedStart"] = str(requested_start)
+        result["executionAssumptions"] = ea
 
     def ensure_storage_schema(self) -> None:
         if self._storage_schema_ready:
@@ -129,19 +270,24 @@ class BacktestService:
     def get_execution_timeframe(self, start_date: datetime, end_date: datetime, market: str = 'crypto') -> tuple:
         """
         Automatically select execution timeframe based on backtest date range.
-        
+
+        Strategy: pick the finest exec timeframe whose total candle count stays
+        below ~25k bars. Longer windows degrade to coarser exec candles instead
+        of failing — so users still get *some* intra-bar precision over a 6+
+        month range, just not 1-minute precision.
+
         Args:
             start_date: Start date
             end_date: End date
             market: Market type
-            
+
         Returns:
             (execution_timeframe, precision_info)
-            - execution_timeframe: '1m' or '5m'
+            - execution_timeframe: '1m' / '5m' / '15m' / '30m' or None
             - precision_info: Precision info dict for frontend display
         """
         days_diff = (end_date - start_date).days
-        
+
         # Only crypto market supports high-precision backtest
         if market.lower() not in ['crypto', 'cryptocurrency']:
             return None, {
@@ -149,38 +295,44 @@ class BacktestService:
                 'reason': 'only_crypto',
                 'message': 'High-precision backtest only supports cryptocurrency market'
             }
-        
-        if days_diff <= self.MTF_CONFIG['max_1m_days']:
-            # Within 15 days: use 1-minute precision
-            estimated_candles = days_diff * 24 * 60
-            return '1m', {
-                'enabled': True,
-                'timeframe': '1m',
-                'days': days_diff,
-                'estimated_candles': estimated_candles,
-                'precision': 'high',
-                'message': f'Using 1-minute precision backtest (~{estimated_candles:,} candles)'
-            }
-        elif days_diff <= self.MTF_CONFIG['max_5m_days']:
-            # 15 days to 1 year: use 5-minute precision
-            estimated_candles = days_diff * 24 * 12
-            return '5m', {
-                'enabled': True,
-                'timeframe': '5m',
-                'days': days_diff,
-                'estimated_candles': estimated_candles,
-                'precision': 'medium',
-                'message': f'Range exceeds {self.MTF_CONFIG["max_1m_days"]} days, using 5-minute precision (~{estimated_candles:,} candles)'
-            }
-        else:
-            # Over 1 year: high-precision backtest not supported
-            return None, {
-                'enabled': False,
-                'reason': 'too_long',
-                'days': days_diff,
-                'max_days': self.MTF_CONFIG['max_5m_days'],
-                'message': f'Backtest range {days_diff} days exceeds max limit {self.MTF_CONFIG["max_5m_days"]} days'
-            }
+
+        # Tier table: (max_days, exec_tf, candles_per_day, precision_label).
+        # Ordered finest-first; we pick the first tier whose cap covers the range.
+        tiers = [
+            (self.MTF_CONFIG['max_1m_days'],  '1m',  24 * 60, 'high'),
+            (self.MTF_CONFIG['max_5m_days'],  '5m',  24 * 12, 'medium'),
+            (self.MTF_CONFIG['max_15m_days'], '15m', 24 * 4,  'medium'),
+            (self.MTF_CONFIG['max_30m_days'], '30m', 24 * 2,  'low'),
+        ]
+
+        for max_days, exec_tf, candles_per_day, precision in tiers:
+            if days_diff <= max_days:
+                estimated_candles = days_diff * candles_per_day
+                return exec_tf, {
+                    'enabled': True,
+                    'timeframe': exec_tf,
+                    'days': days_diff,
+                    'estimated_candles': estimated_candles,
+                    'precision': precision,
+                    # Single, consistent message format so the UI can show the
+                    # exact exec-tf picked + estimated workload at a glance.
+                    'message': f'Using {exec_tf} precision backtest (~{estimated_candles:,} candles)',
+                }
+
+        # Beyond the largest tier: silently fall back to standard backtest at the
+        # strategy timeframe. We mark enabled=False so run_multi_timeframe()
+        # routes to self.run(); the UI surfaces this as "MTF auto-disabled,
+        # using standard backtest" rather than a hard failure.
+        return None, {
+            'enabled': False,
+            'reason': 'range_exceeds_high_precision',
+            'days': days_diff,
+            'max_days': self.MTF_CONFIG['max_30m_days'],
+            'message': (
+                f'High-precision MTF is capped at {self.MTF_CONFIG["max_30m_days"]} days '
+                f'(requested {days_diff} days); falling back to standard candle backtest'
+            ),
+        }
 
     def _liquidation_loss(self, capital: Any) -> float:
         try:
@@ -392,9 +544,39 @@ class BacktestService:
             result = {}
 
         item['total_return'] = result.get('totalReturn')
+        item['total_return_pct'] = item['total_return']
         item['annual_return'] = result.get('annualReturn')
         item['win_rate'] = result.get('winRate')
         item['total_trades'] = result.get('totalTrades')
+        ea = result.get('executionAssumptions') or {}
+        pi = result.get('precision_info') or {}
+        exec_cfg = (item.get('config_snapshot') or {}).get('executionConfig') or {}
+        mtf_active = bool(ea.get('mtfActive') or pi.get('enabled'))
+        strict_mode = ea.get('strictMode')
+        if strict_mode is None:
+            strict_mode = exec_cfg.get('strictMode')
+        if strict_mode is None:
+            timing = str(
+                ea.get('signalTiming')
+                or (item.get('strategy_config') or {}).get('execution', {}).get('signalTiming')
+                or ''
+            ).lower()
+            strict_mode = timing not in ('same_bar_close', 'current_bar_close', 'bar_close', 'close')
+        simulation_mode = str(
+            ea.get('simulationMode') or pi.get('mode') or pi.get('precision') or ''
+        ).lower()
+        if strict_mode:
+            summary_mode = 'strict'
+        elif mtf_active or simulation_mode in ('aggressive_1m', 'mtf'):
+            summary_mode = 'aggressive_1m'
+        else:
+            summary_mode = 'aggressive_bar'
+        item['simulation_summary'] = {
+            'mode': summary_mode,
+            'strictMode': bool(strict_mode),
+            'execTimeframe': ea.get('executionTimeframe') or pi.get('timeframe') or item.get('timeframe'),
+            'mtfFallbackReason': ea.get('mtfFallbackReason') or pi.get('fallback_reason'),
+        }
         if include_result:
             item['result'] = result
         item.pop('result_json', None)
@@ -455,20 +637,31 @@ class BacktestService:
         # Skip MTF when: disabled, not supported, or signal tf <= exec tf (no precision gain)
         signal_tf_seconds = self.TIMEFRAME_SECONDS.get(timeframe, 86400)
         exec_tf_seconds = self.TIMEFRAME_SECONDS.get(exec_tf, 300) if exec_tf else signal_tf_seconds
+        same_bar_timing = signal_timing in (
+            'same_bar_close', 'current_bar_close', 'bar_close', 'close',
+        )
+        timing_supported = signal_timing in (
+            'next_bar_open', 'next_open', 'nextopen', 'next',
+        ) or same_bar_timing
         skip_mtf = (
             not enable_mtf
             or not precision_info.get('enabled')
             or signal_tf_seconds <= exec_tf_seconds
             or has_scale_rules
-            or signal_timing not in ['next_bar_open', 'next_open', 'nextopen', 'next']
+            or not timing_supported
         )
         
         if skip_mtf:
             fallback_reason = None
             if has_scale_rules:
                 fallback_reason = 'scale_rules_not_supported_in_mtf'
-            elif signal_timing not in ['next_bar_open', 'next_open', 'nextopen', 'next']:
+            elif not timing_supported:
                 fallback_reason = 'signal_timing_not_supported_in_mtf'
+            elif not precision_info.get('enabled'):
+                # MTF was disabled by get_execution_timeframe (e.g. range exceeds
+                # the 5m cap or non-crypto market). Surface its precise reason so
+                # the UI can tell users "auto-fell-back to standard candles".
+                fallback_reason = precision_info.get('reason') or 'mtf_unavailable'
             elif signal_tf_seconds <= exec_tf_seconds:
                 fallback_reason = 'no_precision_gain'
             logger.info(
@@ -512,11 +705,17 @@ class BacktestService:
             result['executionAssumptions'] = ea
             return result
         
-        logger.info(f"Multi-timeframe backtest: strategy_tf={timeframe}, exec_tf={exec_tf}, range={start_date} ~ {end_date}")
+        warmup_bars = self._estimate_warmup_bars(indicator_code, indicator_params)
+        signal_start_date = self._warmup_start_date(start_date, timeframe, warmup_bars)
+
+        logger.info(
+            f"Multi-timeframe backtest: strategy_tf={timeframe}, exec_tf={exec_tf}, "
+            f"range={start_date} ~ {end_date}, warmup_bars={warmup_bars}"
+        )
         
         # 1. Fetch strategy timeframe candles (for signal generation)
-        df_signal = self._fetch_kline_data(market, symbol, timeframe, start_date, end_date)
-        if df_signal.empty:
+        df_signal_full = self._fetch_kline_data(market, symbol, timeframe, signal_start_date, end_date)
+        if df_signal_full.empty:
             raise ValueError("No candle data available in the backtest date range")
         
         # 2. Execute indicator code to get signals
@@ -529,7 +728,11 @@ class BacktestService:
             'user_id': user_id,
             'indicator_id': indicator_id,
         }
-        signals = self._execute_indicator(indicator_code, df_signal, backtest_params)
+        signals_full = self._execute_indicator(indicator_code, df_signal_full, backtest_params)
+        df_signal = self._slice_to_backtest_window(df_signal_full, start_date, end_date)
+        if df_signal.empty:
+            raise ValueError("No candle data available in the backtest date range")
+        signals = self._slice_signals_to_window(signals_full, df_signal.index)
         logger.info(f"Signals generated: {list(signals.keys()) if isinstance(signals, dict) else type(signals)}")
         
         # 3. Fetch execution timeframe candles (for precise trade simulation)
@@ -572,7 +775,7 @@ class BacktestService:
         # 4. Use execution timeframe for precise trade simulation
         try:
             logger.info("Starting MTF trading simulation...")
-            equity_curve, trades, total_commission = self._simulate_trading_mtf(
+            _mtf_ret = self._simulate_trading_mtf(
             df_signal=df_signal,
             df_exec=df_exec,
             signals=signals,
@@ -585,6 +788,14 @@ class BacktestService:
                 signal_timeframe=timeframe,
                 exec_timeframe=exec_tf
             )
+            # Backward-compat: older signature returned 3-tuple, current returns
+            # 4-tuple with `total_funding_paid` last. Tolerate both so older
+            # forks of `_simulate_trading_mtf` don't break this call site.
+            if len(_mtf_ret) == 4:
+                equity_curve, trades, total_commission, total_funding = _mtf_ret
+            else:
+                equity_curve, trades, total_commission = _mtf_ret
+                total_funding = 0.0
             logger.info(f"MTF simulation completed: {len(trades)} trades executed")
         except Exception as e:
             logger.error(f"MTF simulation failed: {str(e)}")
@@ -609,6 +820,10 @@ class BacktestService:
             result['execution_timeframe'] = exec_tf
             result['signal_candles'] = len(df_signal)
             result['execution_candles'] = len(df_exec)
+            try:
+                result['totalFundingPaid'] = round(float(total_funding or 0.0), 6)
+            except Exception:
+                result['totalFundingPaid'] = 0.0
             result['executionAssumptions'] = self._execution_assumptions(
                 strategy_config,
                 simulation_mode='mtf',
@@ -617,6 +832,13 @@ class BacktestService:
                 mtf_requested=True,
                 mtf_active=True,
             )
+            self._attach_warmup_to_result(
+                result,
+                warmup_bars=warmup_bars,
+                warmup_start=signal_start_date,
+                requested_start=start_date,
+            )
+            self._attach_actual_range_to_result(result, df_signal)
             logger.info("Backtest result formatted successfully")
         except Exception as e:
             logger.error(f"Failed to format result: {str(e)}")
@@ -660,6 +882,7 @@ class BacktestService:
         position = 0
         entry_price = 0.0
         position_type = None  # 'long' or 'short'
+        lev = max(int(leverage or 1), 1)
         
         # Parse strategy config
         cfg = strategy_config or {}
@@ -670,12 +893,63 @@ class BacktestService:
         trailing_enabled = bool(trailing_cfg.get('enabled'))
         trailing_pct = float(trailing_cfg.get('pct') or 0.0)
         trailing_activation_pct = float(trailing_cfg.get('activationPct') or 0.0)
-        
-        lev = max(int(leverage or 1), 1)
-        stop_loss_pct_eff = stop_loss_pct / lev if stop_loss_pct > 0 else 0
-        take_profit_pct_eff = take_profit_pct / lev if take_profit_pct > 0 else 0
-        trailing_pct_eff = trailing_pct / lev if trailing_pct > 0 else 0
-        trailing_activation_pct_eff = trailing_activation_pct / lev if trailing_activation_pct > 0 else 0
+        exit_owner = str(cfg.get('exitOwner') or cfg.get('exit_owner') or '').strip().lower()
+        if exit_owner == 'indicator':
+            stop_loss_pct = 0.0
+            take_profit_pct = 0.0
+            trailing_enabled = False
+            trailing_pct = 0.0
+            trailing_activation_pct = 0.0
+
+        # Signal-timing mode (next_bar_open / same_bar_close / ...). Mirrors the
+        # parsing done in `run_multi_timeframe`/`run`/`run_strategy_script`. It's
+        # used at the tail of this function by `_annotate_signal_bar_times` to
+        # align each trade with the originating signal candle on the chart.
+        # Historically this was an unbound name here — any successful MTF run
+        # would raise `NameError: name 'signal_timing' is not defined` at the
+        # very last step, masking otherwise-correct results.
+        exec_cfg = cfg.get('execution') or {}
+        signal_timing = str(exec_cfg.get('signalTiming') or 'next_bar_open').strip().lower()
+        same_bar_timing = signal_timing in (
+            'same_bar_close', 'current_bar_close', 'bar_close', 'close',
+        )
+        # Non-strict (same_bar_close): fill at the signal bar's close on the exec TF.
+        # Strict / next_bar_open: fill at the open of the first exec bar after the signal bar.
+        signal_fill_mode = 'close' if same_bar_timing else 'open'
+
+        # Funding rate simulation. Off by default for backward compatibility.
+        # Annual rate accepts both decimal (0.10 = 10%) and percentage (10 = 10%).
+        # We charge `notional * rate_per_period` from capital at every funding
+        # boundary that falls within the bar's [open_ts, open_ts + tf) window.
+        # Sign convention: positive rate => long pays / short receives.
+        fees_cfg = cfg.get('fees') or {}
+        funding_rate_annual_raw = fees_cfg.get('fundingRateAnnual', 0)
+        try:
+            funding_rate_annual = float(funding_rate_annual_raw or 0)
+        except (TypeError, ValueError):
+            funding_rate_annual = 0.0
+        # Auto-detect "percent" inputs (e.g. 10 instead of 0.10).
+        if abs(funding_rate_annual) > 1.5:
+            funding_rate_annual = funding_rate_annual / 100.0
+        try:
+            funding_interval_hours = float(fees_cfg.get('fundingIntervalHours') or 8)
+        except (TypeError, ValueError):
+            funding_interval_hours = 8.0
+        if funding_interval_hours <= 0:
+            funding_interval_hours = 8.0
+        funding_periods_per_year = (365.25 * 24.0) / funding_interval_hours
+        funding_rate_per_period = (funding_rate_annual / funding_periods_per_year) if funding_periods_per_year > 0 else 0.0
+        funding_enabled = abs(funding_rate_per_period) > 1e-12
+        funding_interval_seconds = int(funding_interval_hours * 3600)
+        total_funding_paid = 0.0
+
+        # Risk percentages are the underlying's % price move directly.
+        # Leverage only affects PnL magnitude and liquidation — it does NOT
+        # scale trigger thresholds.
+        stop_loss_pct_eff = stop_loss_pct if stop_loss_pct > 0 else 0
+        take_profit_pct_eff = take_profit_pct if take_profit_pct > 0 else 0
+        trailing_pct_eff = trailing_pct if trailing_pct > 0 else 0
+        trailing_activation_pct_eff = trailing_activation_pct if trailing_activation_pct > 0 else 0
         
         # If trailing stop enabled but no activation threshold set, use take profit threshold
         if trailing_enabled and trailing_pct_eff > 0:
@@ -781,10 +1055,13 @@ class BacktestService:
         
         logger.info(f"Signal timeframe: {signal_timeframe} ({signal_tf_seconds}s), Exec timeframe: {exec_timeframe} ({exec_tf_seconds}s)")
         
-        # Preprocessing: create signal queue sorted by effective time
-        # Each signal executes at the open of the next execution candle after its candle closes
-        logger.info("Initializing signal queue...")
-        signal_queue = []  # [(effective_time, signal_type, signal_bar_time), ...]
+        # Preprocessing: create signal queue sorted by effective time.
+        # next_bar_open → first exec-bar open after signal bar closes.
+        # same_bar_close → last exec-bar close within the signal bar.
+        logger.info(
+            f"Initializing signal queue (fill_mode={signal_fill_mode}, signal_timing={signal_timing})..."
+        )
+        signal_queue = []  # [(sig_bar_end, signal_type, signal_bar_time, fill_mode), ...]
         
         # Debug: check signal values
         debug_signal_counts = {'open_long': 0, 'close_long': 0, 'open_short': 0, 'close_short': 0}
@@ -818,16 +1095,16 @@ class BacktestService:
                 continue
             
             if ol:
-                signal_queue.append((sig_end, 'open_long', sig_time))
+                signal_queue.append((sig_end, 'open_long', sig_time, signal_fill_mode))
                 debug_signal_counts['open_long'] += 1
             if cl:
-                signal_queue.append((sig_end, 'close_long', sig_time))
+                signal_queue.append((sig_end, 'close_long', sig_time, signal_fill_mode))
                 debug_signal_counts['close_long'] += 1
             if os:
-                signal_queue.append((sig_end, 'open_short', sig_time))
+                signal_queue.append((sig_end, 'open_short', sig_time, signal_fill_mode))
                 debug_signal_counts['open_short'] += 1
             if cs:
-                signal_queue.append((sig_end, 'close_short', sig_time))
+                signal_queue.append((sig_end, 'close_short', sig_time, signal_fill_mode))
                 debug_signal_counts['close_short'] += 1
         
         logger.info(f"Debug signal counts from queue building: {debug_signal_counts}")
@@ -854,22 +1131,31 @@ class BacktestService:
         
         logger.info(f"Signal queue built: total {len(signal_queue)} signals")
         if signal_queue:
-            logger.info(f"First signal: {signal_queue[0][1]} @ {signal_queue[0][0]} (from {signal_queue[0][2]})")
-            logger.info(f"Last signal: {signal_queue[-1][1]} @ {signal_queue[-1][0]} (from {signal_queue[-1][2]})")
+            logger.info(
+                f"First signal: {signal_queue[0][1]} @ {signal_queue[0][0]} "
+                f"(from {signal_queue[0][2]}, fill={signal_queue[0][3]})"
+            )
+            logger.info(
+                f"Last signal: {signal_queue[-1][1]} @ {signal_queue[-1][0]} "
+                f"(from {signal_queue[-1][2]}, fill={signal_queue[-1][3]})"
+            )
         else:
             logger.error("Signal queue is empty! Backtest will fail. Check indicator code to ensure it generates buy/sell signals.")
         
         # Count signals by type
         signal_counts = {}
-        for _, sig_type, _ in signal_queue:
+        for _, sig_type, _, _ in signal_queue:
             signal_counts[sig_type] = signal_counts.get(sig_type, 0) + 1
         logger.info(f"Signal counts: {signal_counts}")
         
         # Log first few signal details for debugging
         if signal_queue:
             logger.info(f"First 3 signals details:")
-            for idx, (sig_time, sig_type, sig_bar_time) in enumerate(signal_queue[:3]):
-                logger.info(f"  Signal {idx+1}: {sig_type} @ effective_time={sig_time}, from_bar={sig_bar_time}")
+            for idx, (sig_time, sig_type, sig_bar_time, fill_mode) in enumerate(signal_queue[:3]):
+                logger.info(
+                    f"  Signal {idx+1}: {sig_type} @ effective_time={sig_time}, "
+                    f"from_bar={sig_bar_time}, fill={fill_mode}"
+                )
         
         # Log execution data range
         if len(df_exec) > 0:
@@ -883,6 +1169,7 @@ class BacktestService:
         # Current pending signal to execute
         pending_signal = None  # ('open_long', 'close_long', 'open_short', 'close_short')
         pending_signal_time = None  # Signal effective time
+        pending_fill_mode = 'open'  # 'open' | 'close'
         executed_trades_count = 0  # Debug counter
         
         # Progress logging for large datasets
@@ -891,7 +1178,15 @@ class BacktestService:
         
         logger.info(f"Starting execution loop: {total_exec_candles} candles to process, {len(signal_queue)} signals in queue")
         
-        for i, (timestamp, row) in enumerate(df_exec.iterrows()):
+        # Funding cursor: epoch seconds of the next due funding payment.
+        # Initialised lazily on the first bar so we don't need start_date here.
+        next_funding_ts = None
+        # NOTE: `df_exec.itertuples()` is ~5-10x faster than `iterrows()` on
+        # large frames (50k+ rows in 5m / 90-day backtests) because it skips
+        # building a fresh `pd.Series` per row. `row.Index` is the timestamp
+        # and `row.open/.high/.low/.close` map to the OHLC columns.
+        for i, row in enumerate(df_exec.itertuples(index=True)):
+            timestamp = row.Index
             # Progress logging
             if i > 0 and i % progress_log_interval == 0:
                 progress_pct = (i / total_exec_candles) * 100
@@ -899,32 +1194,102 @@ class BacktestService:
             # 爆仓后直接停止回测，输出结果
             if is_liquidated:
                 break
-            
+
+            # Funding fee accrual — runs once per bar, BEFORE signal/SL processing
+            # so trades that close on this bar still pay one period of carry.
+            # We charge for every funding boundary that falls within
+            # [bar_open_ts, bar_open_ts + exec_tf). Multiple boundaries per bar
+            # are rare (only when exec_tf > funding interval) but handled.
+            if funding_enabled and position != 0:
+                try:
+                    bar_ts = int(timestamp.timestamp())
+                except Exception:
+                    bar_ts = None
+                if bar_ts is not None:
+                    if next_funding_ts is None:
+                        next_funding_ts = ((bar_ts // funding_interval_seconds) + 1) * funding_interval_seconds
+                    bar_end_ts = bar_ts + exec_tf_seconds
+                    while next_funding_ts < bar_end_ts:
+                        if position != 0:
+                            # Notional uses current entry-price reference; this is a
+                            # conservative approximation for cross/isolated margin.
+                            notional = abs(position) * (entry_price if entry_price else 0.0)
+                            if notional > 0:
+                                # Long pays positive funding, short receives it.
+                                sign = 1.0 if position > 0 else -1.0
+                                funding_charge = notional * funding_rate_per_period * sign
+                                capital -= funding_charge
+                                total_funding_paid += funding_charge
+                                if capital <= 0:
+                                    capital = 0
+                                    is_liquidated = True
+                                    break
+                        next_funding_ts += funding_interval_seconds
+                if is_liquidated:
+                    break
+
+            # bar_time: floor of execution timestamp to signal timeframe.
+            # This is the chart-bar that the front-end displays and is used to
+            # anchor buy/sell overlays — prevents sub-bar offset when exec_tf
+            # is finer than signal_tf (e.g. 1m execution on a 1h chart).
+            try:
+                bar_time_str = timestamp.floor(f'{signal_tf_seconds}s').strftime('%Y-%m-%d %H:%M')
+            except Exception:
+                # Fallback: round down manually via epoch seconds
+                try:
+                    epoch = int(timestamp.timestamp())
+                    floored = (epoch // signal_tf_seconds) * signal_tf_seconds
+                    bar_time_str = datetime.utcfromtimestamp(floored).strftime('%Y-%m-%d %H:%M')
+                except Exception:
+                    bar_time_str = timestamp.strftime('%Y-%m-%d %H:%M')
+
             if position == 0 and capital < min_capital_to_trade:
                 is_liquidated = True
                 capital = 0
                 equity_curve.append({'time': timestamp.strftime('%Y-%m-%d %H:%M'), 'value': 0})
                 continue
             
-            open_ = row['open']
-            high = row['high']
-            low = row['low']
-            close = row['close']
-            
+            open_ = row.open
+            high = row.high
+            low = row.low
+            close = row.close
+
             # Use inferred candle price path to determine trigger order
             price_path = self._infer_candle_path(open_, high, low, close)
             
             # Check if new signal becomes effective
-            # Signal executes at the first execution candle open after its candle closes
+            try:
+                bar_ts_for_sig = int(timestamp.timestamp())
+            except Exception:
+                bar_ts_for_sig = None
+            bar_end_ts_for_sig = (
+                bar_ts_for_sig + exec_tf_seconds if bar_ts_for_sig is not None else None
+            )
+
             while signal_queue_idx < len(signal_queue):
-                sig_effective_time, sig_type, sig_bar_time = signal_queue[signal_queue_idx]
+                sig_effective_time, sig_type, sig_bar_time, fill_mode = signal_queue[signal_queue_idx]
+                try:
+                    sig_eff_ts = int(pd.Timestamp(sig_effective_time).timestamp())
+                except Exception:
+                    sig_eff_ts = None
                 
                 # Debug: log first few signal checks
                 if i < 10 and signal_queue_idx < len(signal_queue):
                     logger.debug(f"[i={i}] Checking signal #{signal_queue_idx}: {sig_type} @ {sig_effective_time}, exec_time={timestamp}, position={position}")
                 
-                # If current exec candle time >= signal effective time, signal can execute
-                if timestamp >= sig_effective_time:
+                if fill_mode == 'close':
+                    # Last exec candle that completes the signal bar: bar_end >= sig_bar_end > bar_open
+                    ready = (
+                        bar_end_ts_for_sig is not None
+                        and bar_ts_for_sig is not None
+                        and sig_eff_ts is not None
+                        and bar_end_ts_for_sig >= sig_eff_ts
+                        and bar_ts_for_sig < sig_eff_ts
+                    )
+                else:
+                    ready = timestamp >= sig_effective_time
+
+                if ready:
                     # Check if signal can execute (based on current position)
                     # In both mode, open_long can execute even with short position (will auto-close first)
                     # Similarly, open_short can execute even with long position
@@ -951,9 +1316,13 @@ class BacktestService:
                     if can_execute:
                         pending_signal = sig_type
                         pending_signal_time = sig_effective_time
+                        pending_fill_mode = fill_mode
                         signal_queue_idx += 1
                         if executed_trades_count < 3:
-                            logger.info(f"Signal ready: {sig_type} @ {timestamp} (effective_time={sig_effective_time})")
+                            logger.info(
+                                f"Signal ready: {sig_type} @ {timestamp} "
+                                f"(effective_time={sig_effective_time}, fill={fill_mode})"
+                            )
                         break
                     else:
                         signal_queue_idx += 1
@@ -990,6 +1359,7 @@ class BacktestService:
                                 total_commission_paid += commission_fee
                                 trades.append({
                                     'time': timestamp.strftime('%Y-%m-%d %H:%M'),
+                                    'bar_time': bar_time_str,
                                     'type': 'close_long_stop',
                                     'price': round(exec_price, 4),
                                     'amount': round(position, 4),
@@ -1009,14 +1379,20 @@ class BacktestService:
                                 trail_active = highest_since_entry >= entry_price * (1 + trailing_activation_pct_eff)
                             if trail_active:
                                 tr_price = highest_since_entry * (1 - trailing_pct_eff)
-                                if path_price <= tr_price:
-                                    exec_price = tr_price * (1 - slippage)
+                                exec_price = tr_price * (1 - slippage)
+                                if path_price <= tr_price and trailing_exit_locks_net_profit(
+                                    "long",
+                                    entry_price=entry_price,
+                                    exit_price=exec_price,
+                                    fee_rate=commission,
+                                ):
                                     commission_fee = position * exec_price * commission
                                     profit = (exec_price - entry_price) * position - commission_fee
                                     capital += profit
                                     total_commission_paid += commission_fee
                                     trades.append({
                                         'time': timestamp.strftime('%Y-%m-%d %H:%M'),
+                                        'bar_time': bar_time_str,
                                         'type': 'close_long_trailing',
                                         'price': round(exec_price, 4),
                                         'amount': round(position, 4),
@@ -1040,6 +1416,7 @@ class BacktestService:
                                 total_commission_paid += commission_fee
                                 trades.append({
                                     'time': timestamp.strftime('%Y-%m-%d %H:%M'),
+                                    'bar_time': bar_time_str,
                                     'type': 'close_long_profit',
                                     'price': round(exec_price, 4),
                                     'amount': round(position, 4),
@@ -1071,6 +1448,7 @@ class BacktestService:
                                     is_liquidated = True
                                     trades.append({
                                         'time': timestamp.strftime('%Y-%m-%d %H:%M'),
+                                        'bar_time': bar_time_str,
                                         'type': 'liquidation',
                                         'price': round(exec_price, 4),
                                         'amount': round(shares, 4),
@@ -1082,6 +1460,7 @@ class BacktestService:
                                     total_commission_paid += commission_fee
                                     trades.append({
                                         'time': timestamp.strftime('%Y-%m-%d %H:%M'),
+                                        'bar_time': bar_time_str,
                                         'type': 'close_short_stop',
                                         'price': round(exec_price, 4),
                                         'amount': round(shares, 4),
@@ -1101,8 +1480,13 @@ class BacktestService:
                                 trail_active = lowest_since_entry <= entry_price * (1 - trailing_activation_pct_eff)
                             if trail_active:
                                 tr_price = lowest_since_entry * (1 + trailing_pct_eff)
-                                if path_price >= tr_price:
-                                    exec_price = tr_price * (1 + slippage)
+                                exec_price = tr_price * (1 + slippage)
+                                if path_price >= tr_price and trailing_exit_locks_net_profit(
+                                    "short",
+                                    entry_price=entry_price,
+                                    exit_price=exec_price,
+                                    fee_rate=commission,
+                                ):
                                     commission_fee = shares * exec_price * commission
                                     profit = (entry_price - exec_price) * shares - commission_fee
                                     if capital + profit <= 0:
@@ -1111,6 +1495,7 @@ class BacktestService:
                                         is_liquidated = True
                                         trades.append({
                                             'time': timestamp.strftime('%Y-%m-%d %H:%M'),
+                                            'bar_time': bar_time_str,
                                             'type': 'liquidation',
                                             'price': round(exec_price, 4),
                                             'amount': round(shares, 4),
@@ -1122,6 +1507,7 @@ class BacktestService:
                                         total_commission_paid += commission_fee
                                         trades.append({
                                             'time': timestamp.strftime('%Y-%m-%d %H:%M'),
+                                            'bar_time': bar_time_str,
                                             'type': 'close_short_trailing',
                                             'price': round(exec_price, 4),
                                             'amount': round(shares, 4),
@@ -1145,6 +1531,7 @@ class BacktestService:
                                 total_commission_paid += commission_fee
                                 trades.append({
                                     'time': timestamp.strftime('%Y-%m-%d %H:%M'),
+                                    'bar_time': bar_time_str,
                                     'type': 'close_short_profit',
                                     'price': round(exec_price, 4),
                                     'amount': round(shares, 4),
@@ -1161,20 +1548,30 @@ class BacktestService:
                         pending_signal = None
                         continue
                 
-                # 2. Execute pending signal (at open price)
-                if pending_signal and path_price == open_:
+                # 2. Execute pending signal (next-bar open or same-bar close)
+                if pending_signal:
+                    fill_now = (
+                        (pending_fill_mode == 'open' and path_price == open_)
+                        or (pending_fill_mode == 'close' and path_price == close)
+                    )
+                    if not fill_now:
+                        continue
+                    ref_px = close if pending_fill_mode == 'close' else open_
                     both_mode_active = norm_signals.get('_both_mode', False)
                     if executed_trades_count < 10:
-                        logger.info(f"Executing pending signal: {pending_signal} @ {timestamp}, path_price={path_price}, open={open_}, position={position}")
+                        logger.info(
+                            f"Executing pending signal: {pending_signal} @ {timestamp}, "
+                            f"fill={pending_fill_mode}, ref_px={ref_px}, position={position}"
+                        )
                     
                     # open_long: In both mode, first close short if any, then open long
                     if pending_signal == 'open_long' and (position == 0 or (both_mode_active and position < 0)):
-                        exec_price = open_ * (1 + slippage)
+                        exec_price = ref_px * (1 + slippage)
                         
                         # If in both mode and have short position, close it first
                         if both_mode_active and position < 0:
                             shares_to_close = abs(position)
-                            close_price = open_ * (1 + slippage)
+                            close_price = ref_px * (1 + slippage)
                             close_commission = shares_to_close * close_price * commission
                             close_profit = (entry_price - close_price) * shares_to_close - close_commission
                             capital += close_profit
@@ -1183,6 +1580,7 @@ class BacktestService:
                             total_commission_paid += close_commission
                             trades.append({
                                 'time': timestamp.strftime('%Y-%m-%d %H:%M'),
+                                'bar_time': bar_time_str,
                                 'type': 'close_short',
                                 'price': round(close_price, 4),
                                 'amount': round(shares_to_close, 4),
@@ -1219,6 +1617,7 @@ class BacktestService:
                         lowest_since_entry = exec_price
                         trades.append({
                             'time': timestamp.strftime('%Y-%m-%d %H:%M'),
+                            'bar_time': bar_time_str,
                             'type': 'open_long',
                             'price': round(exec_price, 4),
                             'amount': round(shares, 4),
@@ -1231,7 +1630,7 @@ class BacktestService:
                         pending_signal = None
                     
                     elif pending_signal == 'close_long' and position > 0:
-                        exec_price = open_ * (1 - slippage)
+                        exec_price = ref_px * (1 - slippage)
                         commission_fee = position * exec_price * commission
                         profit = (exec_price - entry_price) * position - commission_fee
                         capital += profit
@@ -1240,6 +1639,7 @@ class BacktestService:
                         total_commission_paid += commission_fee
                         trades.append({
                             'time': timestamp.strftime('%Y-%m-%d %H:%M'),
+                            'bar_time': bar_time_str,
                             'type': 'close_long',
                             'price': round(exec_price, 4),
                             'amount': round(position, 4),
@@ -1258,11 +1658,11 @@ class BacktestService:
                     
                     # open_short: In both mode, first close long if any, then open short
                     elif pending_signal == 'open_short' and (position == 0 or (both_mode_active and position > 0)):
-                        exec_price = open_ * (1 - slippage)
+                        exec_price = ref_px * (1 - slippage)
                         
                         # If in both mode and have long position, close it first
                         if both_mode_active and position > 0:
-                            close_price = open_ * (1 - slippage)
+                            close_price = ref_px * (1 - slippage)
                             close_commission = position * close_price * commission
                             close_profit = (close_price - entry_price) * position - close_commission
                             capital += close_profit
@@ -1271,6 +1671,7 @@ class BacktestService:
                             total_commission_paid += close_commission
                             trades.append({
                                 'time': timestamp.strftime('%Y-%m-%d %H:%M'),
+                                'bar_time': bar_time_str,
                                 'type': 'close_long',
                                 'price': round(close_price, 4),
                                 'amount': round(position, 4),
@@ -1307,6 +1708,7 @@ class BacktestService:
                         lowest_since_entry = exec_price
                         trades.append({
                             'time': timestamp.strftime('%Y-%m-%d %H:%M'),
+                            'bar_time': bar_time_str,
                             'type': 'open_short',
                             'price': round(exec_price, 4),
                             'amount': round(shares, 4),
@@ -1320,7 +1722,7 @@ class BacktestService:
                     
                     elif pending_signal == 'close_short' and position < 0:
                         shares = abs(position)
-                        exec_price = open_ * (1 + slippage)
+                        exec_price = ref_px * (1 + slippage)
                         commission_fee = shares * exec_price * commission
                         profit = (entry_price - exec_price) * shares - commission_fee
                         capital += profit
@@ -1329,6 +1731,7 @@ class BacktestService:
                         total_commission_paid += commission_fee
                         trades.append({
                             'time': timestamp.strftime('%Y-%m-%d %H:%M'),
+                            'bar_time': bar_time_str,
                             'type': 'close_short',
                             'price': round(exec_price, 4),
                             'amount': round(shares, 4),
@@ -1381,8 +1784,10 @@ class BacktestService:
                 logger.error(f"  First few signals: {signal_queue[:min(5, len(signal_queue))]}")
                 logger.error(f"  Exec data range: {df_exec.index[0]} to {df_exec.index[-1]}")
                 raise ValueError(f"No trades executed despite {len(signal_queue)} signals. Check signal timing and position state logic.")
-        
-        return equity_curve, trades, total_commission_paid
+
+        self._annotate_signal_bar_times(trades, signal_tf_seconds, signal_timing)
+
+        return equity_curve, trades, total_commission_paid, total_funding_paid
 
     def run_strategy_snapshot(
         self,
@@ -1424,50 +1829,25 @@ class BacktestService:
                 strategy_config=strategy_config,
             )
 
-        if bool(snapshot.get('enable_mtf')) and str(market).lower() in ['crypto', 'cryptocurrency']:
-            result = self.run_multi_timeframe(
-                indicator_code=code,
-                market=market,
-                symbol=symbol,
-                timeframe=timeframe,
-                start_date=start_date,
-                end_date=end_date,
-                initial_capital=initial_capital,
-                commission=commission,
-                slippage=slippage,
-                leverage=leverage,
-                trade_direction=trade_direction,
-                strategy_config=strategy_config,
-                enable_mtf=True,
-                indicator_params=indicator_params,
-                user_id=user_id,
-                indicator_id=indicator_id,
-            )
-        else:
-            result = self.run(
-                indicator_code=code,
-                market=market,
-                symbol=symbol,
-                timeframe=timeframe,
-                start_date=start_date,
-                end_date=end_date,
-                initial_capital=initial_capital,
-                commission=commission,
-                slippage=slippage,
-                leverage=leverage,
-                trade_direction=trade_direction,
-                strategy_config=strategy_config,
-                indicator_params=indicator_params,
-                user_id=user_id,
-                indicator_id=indicator_id,
-            )
-            result['precision_info'] = {
-                'enabled': False,
-                'timeframe': timeframe,
-                'precision': 'standard',
-                'message': 'Using standard strategy backtest'
-            }
-        return result
+        strict_mode = bool(snapshot.get('strict_mode', True))
+        return self.run_aligned(
+            strict_mode=strict_mode,
+            indicator_code=code,
+            market=market,
+            symbol=symbol,
+            timeframe=timeframe,
+            start_date=start_date,
+            end_date=end_date,
+            initial_capital=initial_capital,
+            commission=commission,
+            slippage=slippage,
+            leverage=leverage,
+            trade_direction=trade_direction,
+            strategy_config=strategy_config,
+            indicator_params=indicator_params,
+            user_id=user_id,
+            indicator_id=indicator_id,
+        )
 
     def _run_script_strategy(
         self,
@@ -1495,22 +1875,32 @@ class BacktestService:
             'trade_direction': trade_direction,
             'strategy_config': strategy_config or {},
         })
+        script_logs = signals.pop('logs', [])
         equity_curve, trades, total_commission = self._simulate_trading(
             df, signals, initial_capital, commission, slippage, leverage, trade_direction, strategy_config
         )
         metrics = self._calculate_metrics(equity_curve, trades, initial_capital, timeframe, start_date, end_date, total_commission)
         result = self._format_result(metrics, equity_curve, trades)
+        result['logs'] = script_logs
         result['precision_info'] = {
             'enabled': False,
             'timeframe': timeframe,
             'precision': 'standard',
             'message': 'Using standard strategy script backtest'
         }
-        result['executionAssumptions'] = self._execution_assumptions(
+        ea = self._execution_assumptions(
             strategy_config,
-            simulation_mode='standard',
+            simulation_mode='script_standard',
             signal_timeframe=timeframe,
+            commission=commission,
+            slippage=slippage,
         )
+        ea['scriptBacktest'] = True
+        ea['strictMode'] = False
+        ea['simulationMode'] = 'script_standard'
+        ea['fillRule'] = 'next_bar_open'
+        result['executionAssumptions'] = ea
+        self._attach_actual_range_to_result(result, df)
         return result
     
     def run_code_strategy(
@@ -1543,30 +1933,166 @@ class BacktestService:
             'output': {}  # Default empty output
         }
         
-        # 4. Execute code
+        # 4. Execute code (with validation + sandbox)
         try:
-            import builtins
-            def safe_import(name, *args, **kwargs):
-                allowed = ['numpy', 'pandas', 'math', 'json', 'datetime', 'time']
-                if name in allowed or name.split('.')[0] in allowed:
-                    return builtins.__import__(name, *args, **kwargs)
-                raise ImportError(f"Import not allowed: {name}")
-            
-            safe_builtins = {k: getattr(builtins, k) for k in dir(builtins) 
-                           if not k.startswith('_') and k not in ['eval', 'exec', 'compile', 'open', 'input', 'exit']}
-            safe_builtins['__import__'] = safe_import
-            
+            from app.utils.safe_exec import build_safe_builtins, safe_exec_with_validation
+
             exec_env = local_vars.copy()
-            exec_env['__builtins__'] = safe_builtins
-            
-            exec(code, exec_env)
-            
+            exec_env['__builtins__'] = build_safe_builtins()
+
+            exec_result = safe_exec_with_validation(
+                code=code,
+                exec_globals=exec_env,
+                timeout=60,
+            )
+            if not exec_result['success']:
+                return {"error": exec_result['error']}
+
             return exec_env.get('output', {})
-            
+
         except Exception as e:
             logger.error(f"Strategy execution failed: {e}")
             logger.error(traceback.format_exc())
             return {"error": str(e)}
+
+    def run_aligned(
+        self,
+        *,
+        strict_mode: bool = True,
+        indicator_code: str,
+        market: str,
+        symbol: str,
+        timeframe: str,
+        start_date: datetime,
+        end_date: datetime,
+        initial_capital: float = 10000.0,
+        commission: float = 0.001,
+        slippage: float = 0.0,
+        leverage: int = 1,
+        trade_direction: str = 'long',
+        strategy_config: Optional[Dict[str, Any]] = None,
+        indicator_params: Optional[Dict[str, Any]] = None,
+        user_id: int = 1,
+        indicator_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Live-aligned backtest: strict → closed-bar signals + next-bar open;
+        non-strict → same-bar signals + 1m execution path (crypto).
+        """
+        from app.services.backtest_execution import (
+            merge_strict_mode_into_strategy_config,
+            precision_info_for_run,
+        )
+
+        cfg = merge_strict_mode_into_strategy_config(strategy_config, strict_mode)
+        mkt = str(market or '').lower()
+
+        if strict_mode:
+            result = self.run(
+                indicator_code=indicator_code,
+                market=market,
+                symbol=symbol,
+                timeframe=timeframe,
+                start_date=start_date,
+                end_date=end_date,
+                initial_capital=initial_capital,
+                commission=commission,
+                slippage=slippage,
+                leverage=leverage,
+                trade_direction=trade_direction,
+                strategy_config=cfg,
+                indicator_params=indicator_params,
+                user_id=user_id,
+                indicator_id=indicator_id,
+            )
+            result['precision_info'] = precision_info_for_run(
+                strict_mode=True, strategy_timeframe=timeframe,
+            )
+            ea = dict(result.get('executionAssumptions') or {})
+            ea['strictMode'] = True
+            ea['fillRule'] = 'next_bar_open'
+            ea['subResolution'] = 'none'
+            ea['simulationMode'] = 'strict_bar'
+            ea['mtfRequested'] = False
+            ea['mtfActive'] = False
+            result['executionAssumptions'] = ea
+            return result
+
+        if mkt in ('crypto', 'cryptocurrency'):
+            result = self.run_multi_timeframe(
+                indicator_code=indicator_code,
+                market=market,
+                symbol=symbol,
+                timeframe=timeframe,
+                start_date=start_date,
+                end_date=end_date,
+                initial_capital=initial_capital,
+                commission=commission,
+                slippage=slippage,
+                leverage=leverage,
+                trade_direction=trade_direction,
+                strategy_config=cfg,
+                enable_mtf=True,
+                indicator_params=indicator_params,
+                user_id=user_id,
+                indicator_id=indicator_id,
+            )
+            pi_raw = result.get('precision_info') or {}
+            mtf_active = bool(pi_raw.get('enabled'))
+            exec_tf = pi_raw.get('timeframe')
+            fallback = pi_raw.get('fallback_reason')
+            result['precision_info'] = precision_info_for_run(
+                strict_mode=False,
+                strategy_timeframe=timeframe,
+                mtf_active=mtf_active,
+                exec_timeframe=exec_tf,
+                fallback_reason=fallback,
+            )
+            ea = dict(result.get('executionAssumptions') or {})
+            ea['strictMode'] = False
+            ea['fillRule'] = 'intra_bar_1m' if mtf_active else 'same_bar_close'
+            ea['subResolution'] = '1m' if mtf_active else 'none'
+            ea['simulationMode'] = 'aggressive_1m' if mtf_active else 'aggressive_bar'
+            ea['mtfRequested'] = True
+            ea['mtfActive'] = mtf_active
+            if fallback and not mtf_active:
+                ea['mtfFallbackReason'] = fallback
+            result['executionAssumptions'] = ea
+            return result
+
+        result = self.run(
+            indicator_code=indicator_code,
+            market=market,
+            symbol=symbol,
+            timeframe=timeframe,
+            start_date=start_date,
+            end_date=end_date,
+            initial_capital=initial_capital,
+            commission=commission,
+            slippage=slippage,
+            leverage=leverage,
+            trade_direction=trade_direction,
+            strategy_config=cfg,
+            indicator_params=indicator_params,
+            user_id=user_id,
+            indicator_id=indicator_id,
+        )
+        result['precision_info'] = precision_info_for_run(
+            strict_mode=False,
+            strategy_timeframe=timeframe,
+            mtf_active=False,
+            fallback_reason='non_crypto',
+        )
+        ea = dict(result.get('executionAssumptions') or {})
+        ea['strictMode'] = False
+        ea['fillRule'] = 'same_bar_close'
+        ea['subResolution'] = 'none'
+        ea['simulationMode'] = 'aggressive_bar'
+        ea['mtfRequested'] = False
+        ea['mtfActive'] = False
+        ea['mtfFallbackReason'] = 'non_crypto'
+        result['executionAssumptions'] = ea
+        return result
 
     def run(
         self,
@@ -1604,9 +2130,13 @@ class BacktestService:
             Backtest result
         """
         
-        # 1. Fetch candle data
-        df = self._fetch_kline_data(market, symbol, timeframe, start_date, end_date)
-        if df.empty:
+        warmup_bars = self._estimate_warmup_bars(indicator_code, indicator_params)
+        signal_start_date = self._warmup_start_date(start_date, timeframe, warmup_bars)
+
+        # 1. Fetch candle data. Indicators execute on warmup+window data, while
+        # trading starts strictly at the user-requested start_date.
+        df_full = self._fetch_kline_data(market, symbol, timeframe, signal_start_date, end_date)
+        if df_full.empty:
             raise ValueError("No candle data available in the backtest date range")
         
         
@@ -1620,12 +2150,24 @@ class BacktestService:
             'user_id': user_id,
             'indicator_id': indicator_id,
         }
-        signals = self._execute_indicator(indicator_code, df, backtest_params)
+        signals_full = self._execute_indicator(indicator_code, df_full, backtest_params)
+        df = self._slice_to_backtest_window(df_full, start_date, end_date)
+        if df.empty:
+            raise ValueError("No candle data available in the backtest date range")
+        signals = self._slice_signals_to_window(signals_full, df.index)
         
         # 3. Simulate trading
         equity_curve, trades, total_commission = self._simulate_trading(
             df, signals, initial_capital, commission, slippage, leverage, trade_direction, strategy_config
         )
+
+        exec_cfg = (strategy_config or {}).get('execution') or {}
+        signal_timing = str(exec_cfg.get('signalTiming') or 'next_bar_open').strip().lower()
+        signal_tf_seconds = self.TIMEFRAME_SECONDS.get(timeframe, 3600)
+        for trade in trades:
+            if not trade.get('bar_time'):
+                trade['bar_time'] = trade.get('time')
+        self._annotate_signal_bar_times(trades, signal_tf_seconds, signal_timing)
         
         # 4. Calculate metrics
         metrics = self._calculate_metrics(equity_curve, trades, initial_capital, timeframe, start_date, end_date, total_commission)
@@ -1637,7 +2179,26 @@ class BacktestService:
             simulation_mode='standard',
             signal_timeframe=timeframe,
         )
+        self._attach_warmup_to_result(
+            result,
+            warmup_bars=warmup_bars,
+            warmup_start=signal_start_date,
+            requested_start=start_date,
+        )
+        self._attach_actual_range_to_result(result, df)
         return result
+    
+    @staticmethod
+    def _attach_actual_range_to_result(result: Dict[str, Any], df: pd.DataFrame) -> None:
+        """因上游 K 线不足而缩短区间时，写入 executionAssumptions（供前端展示，非错误）。"""
+        attrs = getattr(df, "attrs", None) or {}
+        ar = attrs.get("backtestActualRange")
+        if not ar:
+            return
+        ea = dict(result.get("executionAssumptions") or {})
+        ea["actualDataRange"] = ar
+        ea["requestedRangeAdjusted"] = True
+        result["executionAssumptions"] = ea
     
     def _fetch_kline_data(
         self,
@@ -1647,25 +2208,46 @@ class BacktestService:
         start_date: datetime,
         end_date: datetime
     ) -> pd.DataFrame:
-        """Fetch candle data and convert to DataFrame"""
-        # Calculate required candle count
+        """Fetch candle data and convert to DataFrame (with in-memory caching)"""
+        # Calculate required candle count (+ slack for 2y-class windows & upstream gaps)
         total_seconds = (end_date - start_date).total_seconds()
         tf_seconds = self.TIMEFRAME_SECONDS.get(timeframe, 86400)
-        limit = math.ceil(total_seconds / tf_seconds) + 200
-        
+        raw_bars = max(1, math.ceil(total_seconds / tf_seconds))
+        limit = int(math.ceil(raw_bars * 1.15) + 200)
+
+        # Earliest candle we need (backtest may span up to ~2y; align fetch window to real start)
+        after_time = int((start_date - timedelta(days=1)).timestamp())
+
         # Calculate before_time (end date + 1 day)
         before_time = int((end_date + timedelta(days=1)).timestamp())
+
+        cache_key = f"{market}:{symbol}:{timeframe}:{start_date.date()}:{end_date.date()}"
+        cached = _kline_cache.get(cache_key)
+        if cached is not None and not cached.empty:
+            logger.info(f"K-line cache HIT for {cache_key} ({len(cached)} candles)")
+            return cached
         
-        
-        # Fetch data
-        kline_data = DataSourceFactory.get_kline(
-            market=market,
-            symbol=symbol,
-            timeframe=timeframe,
-            limit=limit,
-            before_time=before_time
-        )
-        
+        # Fetch data. We deliberately swallow any upstream exception (CCXT
+        # network/rate-limit errors, yfinance hiccups, etc.) and return an empty
+        # DataFrame instead — the MTF entry point then falls back to a standard
+        # backtest with a clear `mtfFallbackReason='data_unavailable'`, which is
+        # far friendlier than bubbling up a 500.
+        try:
+            kline_data = DataSourceFactory.get_kline(
+                market=market,
+                symbol=symbol,
+                timeframe=timeframe,
+                limit=limit,
+                before_time=before_time,
+                after_time=after_time,
+            )
+        except Exception as exc:
+            logger.warning(
+                f"DataSourceFactory.get_kline raised for {market}:{symbol} {timeframe} "
+                f"(limit={limit}): {exc}; returning empty DataFrame so the caller can fall back."
+            )
+            return pd.DataFrame()
+
         if not kline_data:
             logger.warning(f"No candle data retrieved for {market}:{symbol}, timeframe={timeframe}, limit={limit}, before_time={before_time}")
             return pd.DataFrame()
@@ -1705,46 +2287,90 @@ class BacktestService:
             data_start = df.index.min()
             data_end = df.index.max()
             logger.info(f"Kline data range: {data_start} to {data_end}, requested range: {start_date} to {end_date}")
-            
-            # Check if requested range is within available data
-            if data_start > start_date:
-                logger.warning(f"Requested start date {start_date} is before available data start {data_start}. "
-                             f"Using available start date instead.")
-            if data_end < end_date:
-                logger.warning(f"Requested end date {end_date} is after available data end {data_end}. "
-                             f"Using available end date instead. This may affect backtest results.")
-            
-            # Filter date range (use available data range if requested range is outside)
-            # If data ends before requested end_date, use the most recent data up to the requested limit
-            if data_end < end_date:
-                # Data ends before requested end date - use the most recent data
-                # Calculate how many candles we need based on requested time range
-                requested_seconds = (end_date - start_date).total_seconds()
-                requested_candles = math.ceil(requested_seconds / tf_seconds)
-                # Take the most recent N candles from available data
-                if len(df) > requested_candles:
-                    df_filtered = df.tail(requested_candles).copy()
+
+            if data_start > start_date or data_end < end_date:
+                logger.debug(
+                    "Backtest requested window wider than upstream: "
+                    f"requested=[{start_date} ~ {end_date}], upstream=[{data_start} ~ {data_end}]"
+                )
+
+            # 首选：请求区间与可用数据的交集（例如不满2年时自动从首根可用K开始）
+            rs = pd.Timestamp(start_date)
+            re = pd.Timestamp(end_date)
+            effective_start = max(rs, pd.Timestamp(data_start))
+            effective_end = min(re, pd.Timestamp(data_end))
+            window_adjusted = False
+
+            if effective_start <= effective_end:
+                df_filtered = df[(df.index >= effective_start) & (df.index <= effective_end)].copy()
+            else:
+                # 无交集：从第一根可用 K 回测到「用户结束日」与「数据末」的较早者，不视为错误
+                alt_start = pd.Timestamp(data_start)
+                alt_end = min(re, pd.Timestamp(data_end))
+                if alt_start <= alt_end:
+                    df_filtered = df[(df.index >= alt_start) & (df.index <= alt_end)].copy()
+                    effective_start, effective_end = alt_start, alt_end
+                    window_adjusted = True
+                    logger.info(
+                        f"[Backtest] 可用K线未覆盖所选起点，已从首根可用K线开始回测 "
+                        f"{market}:{symbol} {timeframe} effective=[{effective_start} ~ {effective_end}]"
+                    )
+                elif len(df) > 0:
+                    df_filtered = df.copy()
                     effective_start = df_filtered.index.min()
                     effective_end = df_filtered.index.max()
+                    window_adjusted = True
+                    logger.info(
+                        f"[Backtest] 所选区间与可用数据无重叠，使用全部可用K线 "
+                        f"{market}:{symbol} {timeframe} [{effective_start} ~ {effective_end}]"
+                    )
                 else:
-                    # Use all available data
-                    df_filtered = df.copy()
-                    effective_start = data_start
-                    effective_end = data_end
-                    logger.warning(f"Available data ({len(df)} candles) is less than requested ({requested_candles} candles). "
-                                 f"Using all available data from {effective_start} to {effective_end}")
-            else:
-                # Normal case: filter by requested date range
-                effective_start = max(start_date, data_start)
-                effective_end = min(end_date, data_end)
-                df_filtered = df[(df.index >= effective_start) & (df.index <= effective_end)].copy()
-            
+                    return pd.DataFrame()
+
+            used_fallback = window_adjusted
+
+            # Diagnostics: did we actually cover a meaningful portion of the requested range?
+            requested_seconds = max(1.0, (end_date - start_date).total_seconds())
+            covered_seconds = 0.0
+            if not df_filtered.empty:
+                covered_seconds = (df_filtered.index.max() - df_filtered.index.min()).total_seconds()
+            coverage_ratio = covered_seconds / requested_seconds if requested_seconds > 0 else 0.0
+
             if df_filtered.empty:
-                logger.error(f"After filtering date range ({effective_start} to {effective_end}), no data remains. "
-                             f"Available data range: {data_start} to {data_end}, requested: {start_date} to {end_date}")
-                return pd.DataFrame()
-            
-            logger.info(f"After filtering: {len(df_filtered)} candles remain for backtest (effective range: {effective_start} to {effective_end})")
+                # Last-resort：取最近 N 根（上游时间戳异常等），仅记 debug，不对用户报错
+                requested_candles = max(1, math.ceil(requested_seconds / tf_seconds))
+                if len(df) > 0:
+                    df_filtered = df.tail(min(len(df), requested_candles)).copy()
+                    effective_start = df_filtered.index.min()
+                    effective_end = df_filtered.index.max()
+                    used_fallback = True
+                    logger.debug(
+                        f"[Backtest] 过滤后为空，已回退为最近 {len(df_filtered)} 根K线 "
+                        f"{market}:{symbol} {timeframe} ({effective_start} ~ {effective_end})"
+                    )
+                else:
+                    logger.debug(
+                        f"[Backtest] 过滤后无K线 {market}:{symbol} {timeframe} "
+                        f"upstream={data_start}~{data_end}"
+                    )
+                    return pd.DataFrame()
+
+            if pd.Timestamp(data_start) > rs or window_adjusted:
+                df_filtered.attrs["backtestActualRange"] = {
+                    "requestedStart": str(rs),
+                    "requestedEnd": str(re),
+                    "actualStart": str(effective_start),
+                    "actualEnd": str(effective_end),
+                }
+
+            logger.info(
+                f"[Backtest] {market}:{symbol} {timeframe} | "
+                f"requested [{start_date} ~ {end_date}] | "
+                f"upstream [{data_start} ~ {data_end}] ({len(df)} candles) | "
+                f"effective [{effective_start} ~ {effective_end}] ({len(df_filtered)} candles) | "
+                f"coverage={coverage_ratio*100:.1f}% | fallback={used_fallback}"
+            )
+            _kline_cache.put(cache_key, df_filtered, timeframe)
             return df_filtered
             
         except Exception as e:
@@ -1811,54 +2437,16 @@ class BacktestService:
             # Add technical indicator functions
             local_vars.update(self._get_indicator_functions())
             
-            # Add safe builtins (keep full builtins to support lambda etc.)
-            # but remove dangerous functions like eval, exec, open etc.
-            import builtins
-            
-            # Create restricted __import__ that only allows safe modules
-            def safe_import(name, *args, **kwargs):
-                """Only allow importing numpy, pandas, math, json etc."""
-                allowed_modules = ['numpy', 'pandas', 'math', 'json', 'datetime', 'time']
-                if name in allowed_modules or name.split('.')[0] in allowed_modules:
-                    return builtins.__import__(name, *args, **kwargs)
-                raise ImportError(f"Import not allowed: {name}")
-            
-            safe_builtins = {k: getattr(builtins, k) for k in dir(builtins) 
-                           if not k.startswith('_') and k not in [
-                               'eval', 'exec', 'compile', 'open', 'input',
-                               'help', 'exit', 'quit',
-                               'copyright', 'credits', 'license'
-                           ]}
-            
-            # Add restricted __import__
-            safe_builtins['__import__'] = safe_import
-            
-            # Create unified execution environment (globals and locals use same dict)
-            # This allows functions to access np, pd etc.
+            from app.utils.safe_exec import build_safe_builtins, safe_exec_with_validation
+
             exec_env = local_vars.copy()
-            exec_env['__builtins__'] = safe_builtins
-            
-            # Pre-execute import statements to ensure np and pd are available
-            pre_import_code = """
-import numpy as np
-import pandas as pd
-"""
-            exec(pre_import_code, exec_env)
-            
-            # Security check: validate code doesn't contain dangerous operations
-            from app.utils.safe_exec import validate_code_safety
-            is_safe, error_msg = validate_code_safety(code)
-            if not is_safe:
-                logger.error(f"Backtest code security check failed: {error_msg}")
-                raise ValueError(f"Code contains unsafe operations: {error_msg}")
-            
-            # Execute user code safely (with timeout)
-            from app.utils.safe_exec import safe_exec_code
-            exec_result = safe_exec_code(
+            exec_env['__builtins__'] = build_safe_builtins()
+
+            exec_result = safe_exec_with_validation(
                 code=code,
                 exec_globals=exec_env,
                 exec_locals=exec_env,
-                timeout=60  # Backtest allows longer time (60 seconds)
+                timeout=60,
             )
             
             if not exec_result['success']:
@@ -1872,14 +2460,17 @@ import pandas as pd
                 elif len(executed_df) == len(df):
                     executed_df.index = df.index
 
-            # Validation: if chart signals are provided, df['buy']/df['sell'] must exist for backtest normalization.
-            # This keeps indicator scripts simple and consistent (chart=buy/sell, execution=normalized in backend).
+            # Validation: chart markers in output['signals'] require df execution columns.
+            # four_way scripts may omit buy/sell when open/close_* columns are present.
             output_obj = exec_env.get('output')
             has_output_signals = isinstance(output_obj, dict) and isinstance(output_obj.get('signals'), list) and len(output_obj.get('signals')) > 0
-            if has_output_signals and not all(col in executed_df.columns for col in ['buy', 'sell']):
+            has_four_way = all(col in executed_df.columns for col in ['open_long', 'close_long', 'open_short', 'close_short'])
+            has_buy_sell = all(col in executed_df.columns for col in ['buy', 'sell'])
+            if has_output_signals and not has_four_way and not has_buy_sell:
                 raise ValueError(
-                    "Invalid indicator script: output['signals'] is provided, but df['buy'] and df['sell'] are missing. "
-                    "Please set df['buy'] and df['sell'] as boolean columns (len == len(df))."
+                    "Invalid indicator script: output['signals'] is provided, but df execution columns are missing. "
+                    "Set four-way df['open_long'], df['close_long'], df['open_short'], and df['close_short']. "
+                    "output['signals'] is chart-only and cannot place orders."
                 )
             
             # Extract signals from executed df
@@ -1921,7 +2512,7 @@ import pandas as pd
                 raise ValueError(
                     "Indicator must define either 4-way columns "
                     "(df['open_long'], df['close_long'], df['open_short'], df['close_short']) "
-                    "or simple columns (df['buy'], df['sell'])."
+                    "for new scripts. Legacy df['buy']/df['sell'] is still executable only for existing saved code."
                 )
             
         except Exception as e:
@@ -1930,7 +2521,7 @@ import pandas as pd
         
         return signals
 
-    def _execute_script_strategy(self, code: str, df: pd.DataFrame, runtime: Optional[Dict[str, Any]] = None) -> Dict[str, pd.Series]:
+    def _execute_script_strategy(self, code: str, df: pd.DataFrame, runtime: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         runtime = runtime or {}
         if not code or not str(code).strip():
             raise ValueError("Strategy script is empty")
@@ -1946,161 +2537,30 @@ import pandas as pd
         add_long = pd.Series(False, index=df.index)
         add_short = pd.Series(False, index=df.index)
 
-        class ScriptBar(dict):
-            def __getattr__(self, name: str) -> Any:
-                try:
-                    return self[name]
-                except KeyError as exc:
-                    raise AttributeError(name) from exc
-
-        class ScriptPosition(dict):
-            def __init__(self):
-                super().__init__()
-                self.clear_position()
-
-            def __getattr__(self, name: str) -> Any:
-                try:
-                    return self[name]
-                except KeyError as exc:
-                    raise AttributeError(name) from exc
-
-            def __bool__(self) -> bool:
-                return bool(self.get('side')) and float(self.get('size') or 0) > 0
-
-            def __int__(self) -> int:
-                return int(self.get('direction') or 0)
-
-            def __float__(self) -> float:
-                return float(self.get('direction') or 0)
-
-            def __eq__(self, other: Any) -> bool:
-                try:
-                    return int(self) == int(other)
-                except Exception:
-                    return dict.__eq__(self, other)
-
-            def __lt__(self, other: Any) -> bool:
-                return int(self) < int(other)
-
-            def __le__(self, other: Any) -> bool:
-                return int(self) <= int(other)
-
-            def __gt__(self, other: Any) -> bool:
-                return int(self) > int(other)
-
-            def __ge__(self, other: Any) -> bool:
-                return int(self) >= int(other)
-
-            def clear_position(self) -> None:
-                self.clear()
-                self.update({
-                    'side': '',
-                    'size': 0.0,
-                    'entry_price': 0.0,
-                    'direction': 0,
-                    'amount': 0.0,
-                })
-
-            def open_position(self, side: str, entry_price: float, amount: float) -> None:
-                direction = 1 if side == 'long' else (-1 if side == 'short' else 0)
-                size = float(amount or 0.0)
-                price = float(entry_price or 0.0)
-                self.clear()
-                self.update({
-                    'side': side,
-                    'size': size,
-                    'entry_price': price,
-                    'direction': direction,
-                    'amount': size,
-                })
-
-            def add_position(self, entry_price: float, amount: float) -> None:
-                extra = float(amount or 0.0)
-                if extra <= 0:
-                    return
-                current_size = float(self.get('size') or 0.0)
-                current_price = float(self.get('entry_price') or 0.0)
-                next_size = current_size + extra
-                next_price = float(entry_price or current_price or 0.0)
-                if current_size > 0 and current_price > 0 and next_size > 0:
-                    next_price = ((current_price * current_size) + (float(entry_price or current_price) * extra)) / next_size
-                self['size'] = next_size
-                self['amount'] = next_size
-                self['entry_price'] = next_price
-
-        class ScriptBacktestContext:
-            def __init__(self, bars_df: pd.DataFrame, initial_balance: float):
-                self._bars_df = bars_df
-                self._params: Dict[str, Any] = {}
-                self._orders: List[Dict[str, Any]] = []
-                self._logs: List[str] = []
-                self.current_index = -1
-                self.position = ScriptPosition()
-                self.balance = float(initial_balance)
-                self.equity = float(initial_balance)
-
-            def param(self, name: str, default: Any = None) -> Any:
-                if name not in self._params:
-                    self._params[name] = default
-                return self._params[name]
-
-            def bars(self, n: int = 1):
-                start = max(0, self.current_index - int(n) + 1)
-                out = []
-                for _, row in self._bars_df.iloc[start:self.current_index + 1].iterrows():
-                    out.append(ScriptBar(
-                        open=float(row.get('open') or 0),
-                        high=float(row.get('high') or 0),
-                        low=float(row.get('low') or 0),
-                        close=float(row.get('close') or 0),
-                        volume=float(row.get('volume') or 0),
-                        timestamp=row.get('time')
-                    ))
-                return out
-
-            def log(self, message: Any):
-                self._logs.append(str(message))
-
-            def buy(self, price: Any = None, amount: Any = None):
-                self._orders.append({'action': 'buy', 'price': price, 'amount': amount})
-
-            def sell(self, price: Any = None, amount: Any = None):
-                self._orders.append({'action': 'sell', 'price': price, 'amount': amount})
-
-            def close_position(self):
-                self._orders.append({'action': 'close'})
+        # Share the live-trading hedge-aware ctx implementation so the two
+        # paths can't drift apart (P0-1, May 2026). ScriptBar is still needed
+        # locally to inject the per-bar payload.
+        from app.services.strategy_script_runtime import (
+            ScriptBar,
+            ScriptPosition,
+            StrategyScriptContext as ScriptBacktestContext,
+        )
 
         try:
-            import builtins
-
-            def safe_import(name, *args, **kwargs):
-                allowed_modules = ['numpy', 'pandas', 'math', 'json', 'datetime', 'time']
-                if name in allowed_modules or name.split('.')[0] in allowed_modules:
-                    return builtins.__import__(name, *args, **kwargs)
-                raise ImportError(f"Import not allowed: {name}")
-
-            safe_builtins = {k: getattr(builtins, k) for k in dir(builtins)
-                             if not k.startswith('_') and k not in ['eval', 'exec', 'compile', 'open', 'input', 'help', 'exit', 'quit']}
-            safe_builtins['__import__'] = safe_import
+            from app.utils.safe_exec import build_safe_builtins, safe_exec_with_validation
 
             ctx = ScriptBacktestContext(df_exec, float(runtime.get('initial_capital') or 10000))
             exec_env = {
-                '__builtins__': safe_builtins,
+                '__builtins__': build_safe_builtins(),
                 'np': np,
                 'pd': pd,
             }
 
-            from app.utils.safe_exec import validate_code_safety
-            is_safe, error_msg = validate_code_safety(code)
-            if not is_safe:
-                raise ValueError(f"Code contains unsafe operations: {error_msg}")
-
-            from app.utils.safe_exec import safe_exec_code
-            exec_result = safe_exec_code(
+            exec_result = safe_exec_with_validation(
                 code=code,
                 exec_globals=exec_env,
                 exec_locals=exec_env,
-                timeout=60
+                timeout=60,
             )
             if not exec_result['success']:
                 raise RuntimeError(f"Code execution failed: {exec_result['error']}")
@@ -2131,41 +2591,71 @@ import pandas as pd
 
                 for order in ctx._orders:
                     action = str(order.get('action') or '').lower()
+                    intent = str(order.get('intent') or 'auto').lower()
                     order_price = float(order.get('price') or bar['close'] or 0)
                     order_amount = float(order.get('amount') or 0)
+
                     if action == 'close':
-                        if ctx.position > 0:
+                        if ctx.position.has_long():
                             close_long.iloc[i] = True
-                            ctx.position.clear_position()
-                        elif ctx.position < 0:
+                            ctx.position.close_long()
+                        if ctx.position.has_short():
                             close_short.iloc[i] = True
-                            ctx.position.clear_position()
+                            ctx.position.close_short()
+                        continue
+
+                    # Explicit hedge intents — ctx.close_long / close_short /
+                    # open_long / open_short. Keep both legs independent.
+                    if intent == 'close_long':
+                        if ctx.position.has_long():
+                            close_long.iloc[i] = True
+                            ctx.position.reduce_long(order_amount or ctx.position.long_size)
+                        continue
+                    if intent == 'close_short':
+                        if ctx.position.has_short():
+                            close_short.iloc[i] = True
+                            ctx.position.reduce_short(order_amount or ctx.position.short_size)
+                        continue
+                    if intent == 'open_long':
+                        if trade_direction in ('long', 'both'):
+                            if ctx.position.has_long():
+                                add_long.iloc[i] = True
+                            else:
+                                open_long.iloc[i] = True
+                            ctx.position.open_long(order_price, order_amount)
+                        continue
+                    if intent == 'open_short':
+                        if trade_direction in ('short', 'both'):
+                            if ctx.position.has_short():
+                                add_short.iloc[i] = True
+                            else:
+                                open_short.iloc[i] = True
+                            ctx.position.open_short(order_price, order_amount)
                         continue
 
                     if action == 'buy':
-                        if ctx.position < 0:
+                        # Auto intent: cover short leg first, otherwise stack long.
+                        if ctx.position.has_short():
                             close_short.iloc[i] = True
-                            ctx.position.clear_position()
+                            ctx.position.close_short()
                         if trade_direction in ('long', 'both'):
-                            if ctx.position == 0:
-                                open_long.iloc[i] = True
-                                ctx.position.open_position('long', order_price, order_amount)
-                            else:
+                            if ctx.position.has_long():
                                 add_long.iloc[i] = True
-                                ctx.position.add_position(order_price, order_amount)
+                            else:
+                                open_long.iloc[i] = True
+                            ctx.position.open_long(order_price, order_amount)
                         continue
 
                     if action == 'sell':
-                        if ctx.position > 0:
+                        if ctx.position.has_long():
                             close_long.iloc[i] = True
-                            ctx.position.clear_position()
+                            ctx.position.close_long()
                         if trade_direction in ('short', 'both'):
-                            if ctx.position == 0:
-                                open_short.iloc[i] = True
-                                ctx.position.open_position('short', order_price, order_amount)
-                            else:
+                            if ctx.position.has_short():
                                 add_short.iloc[i] = True
-                                ctx.position.add_position(order_price, order_amount)
+                            else:
+                                open_short.iloc[i] = True
+                            ctx.position.open_short(order_price, order_amount)
 
             return {
                 'open_long': open_long,
@@ -2174,6 +2664,7 @@ import pandas as pd
                 'close_short': close_short,
                 'add_long': add_long,
                 'add_short': add_short,
+                'logs': ctx.flush_logs(),
             }
         except Exception as e:
             logger.error(f"Strategy script execution error: {e}")
@@ -2302,8 +2793,25 @@ import pandas as pd
         else:
             raise ValueError("signals dict must contain either 4-way keys or buy/sell keys.")
 
+        try:
+            data_start = df.index.min()
+            data_end = df.index.max()
+        except Exception:
+            data_start = data_end = None
+        try:
+            ol = int(norm.get('open_long').sum()) if hasattr(norm.get('open_long'), 'sum') else 0
+            cl = int(norm.get('close_long').sum()) if hasattr(norm.get('close_long'), 'sum') else 0
+            os_ = int(norm.get('open_short').sum()) if hasattr(norm.get('open_short'), 'sum') else 0
+            cs = int(norm.get('close_short').sum()) if hasattr(norm.get('close_short'), 'sum') else 0
+        except Exception:
+            ol = cl = os_ = cs = -1
+        logger.info(
+            f"[Backtest] simulate_trading: {len(df)} candles [{data_start} ~ {data_end}], "
+            f"signals open_long={ol} close_long={cl} open_short={os_} close_short={cs}, "
+            f"direction={trade_direction}"
+        )
         return self._simulate_trading_new_format(df, norm, initial_capital, commission, slippage, leverage, trade_direction, strategy_config)
-    
+
     def _simulate_trading_new_format(
         self,
         df: pd.DataFrame,
@@ -2351,13 +2859,20 @@ import pandas as pd
         trailing_enabled = bool(trailing_cfg.get('enabled'))
         trailing_pct = float(trailing_cfg.get('pct') or 0.0)
         trailing_activation_pct = float(trailing_cfg.get('activationPct') or 0.0)
+        exit_owner = str(cfg.get('exitOwner') or cfg.get('exit_owner') or '').strip().lower()
+        if exit_owner == 'indicator':
+            stop_loss_pct = 0.0
+            take_profit_pct = 0.0
+            trailing_enabled = False
+            trailing_pct = 0.0
+            trailing_activation_pct = 0.0
 
-        # Risk percentages are defined on margin PnL; convert to price move thresholds by leverage.
-        lev = max(int(leverage or 1), 1)
-        stop_loss_pct_eff = stop_loss_pct / lev
-        take_profit_pct_eff = take_profit_pct / lev
-        trailing_pct_eff = trailing_pct / lev
-        trailing_activation_pct_eff = trailing_activation_pct / lev
+        # Risk percentages are the underlying's % price move directly.
+        # Leverage only affects PnL magnitude / liquidation, NOT trigger thresholds.
+        stop_loss_pct_eff = stop_loss_pct
+        take_profit_pct_eff = take_profit_pct
+        trailing_pct_eff = trailing_pct
+        trailing_activation_pct_eff = trailing_activation_pct
 
         # Conflict rule (TP vs trailing):
         # - If trailing is enabled, it takes precedence.
@@ -2366,14 +2881,6 @@ import pandas as pd
         if trailing_enabled and trailing_pct_eff > 0:
             if trailing_activation_pct_eff <= 0 and take_profit_pct_eff > 0:
                 trailing_activation_pct_eff = take_profit_pct_eff
-
-        # IMPORTANT: risk percentages are defined on margin PnL (user expectation):
-        # e.g. 10x leverage + 5% SL means ~0.5% adverse price move.
-        lev = max(int(leverage or 1), 1)
-        stop_loss_pct_eff = stop_loss_pct / lev
-        take_profit_pct_eff = take_profit_pct / lev
-        trailing_pct_eff = trailing_pct / lev
-        trailing_activation_pct_eff = trailing_activation_pct / lev
 
         pos_cfg = cfg.get('position') or {}
         entry_pct_cfg = float(pos_cfg.get('entryPct') or 1.0)  # expected 0~1
@@ -2413,12 +2920,11 @@ import pandas as pd
         adverse_reduce_size_pct = float(adverse_reduce_cfg.get('sizePct') or 0.0)
         adverse_reduce_max_times = int(adverse_reduce_cfg.get('maxTimes') or 0)
 
-        # Trigger pct as post-leverage margin threshold: divide by leverage for price trigger
-        # e.g. 10x + 5% trigger means ~0.5% price movement
-        trend_add_step_pct_eff = trend_add_step_pct / lev
-        dca_add_step_pct_eff = dca_add_step_pct / lev
-        trend_reduce_step_pct_eff = trend_reduce_step_pct / lev
-        adverse_reduce_step_pct_eff = adverse_reduce_step_pct / lev
+        # Step percentages are the underlying's % price move directly (no leverage scaling).
+        trend_add_step_pct_eff = trend_add_step_pct
+        dca_add_step_pct_eff = dca_add_step_pct
+        trend_reduce_step_pct_eff = trend_reduce_step_pct
+        adverse_reduce_step_pct_eff = adverse_reduce_step_pct
 
         # State: used for trailing exits and scale-in/scale-out anchor levels
         highest_since_entry = None
@@ -2552,7 +3058,13 @@ import pandas as pd
                             trail_active = highest_since_entry >= entry_price * (1 + trailing_activation_pct_eff)
                         if trail_active:
                             tr_price = highest_since_entry * (1 - trailing_pct_eff)
-                            if low <= tr_price:
+                            tr_exec_price = tr_price * (1 - slippage)
+                            if low <= tr_price and trailing_exit_locks_net_profit(
+                                "long",
+                                entry_price=entry_price,
+                                exit_price=tr_exec_price,
+                                fee_rate=commission,
+                            ):
                                 candidates.append(('close_long_trailing', tr_price))
 
                     if candidates:
@@ -2603,7 +3115,13 @@ import pandas as pd
                             trail_active = lowest_since_entry <= entry_price * (1 - trailing_activation_pct_eff)
                         if trail_active:
                             tr_price = lowest_since_entry * (1 + trailing_pct_eff)
-                            if high >= tr_price:
+                            tr_exec_price = tr_price * (1 + slippage)
+                            if high >= tr_price and trailing_exit_locks_net_profit(
+                                "short",
+                                entry_price=entry_price,
+                                exit_price=tr_exec_price,
+                                fee_rate=commission,
+                            ):
                                 candidates.append(('close_short_trailing', tr_price))
 
                     if candidates:
@@ -3548,1081 +4066,6 @@ import pandas as pd
         
         return equity_curve, trades, total_commission_paid
     
-    def _simulate_trading_old_format(
-        self,
-        df: pd.DataFrame,
-        signals: pd.Series,
-        initial_capital: float,
-        commission: float,
-        slippage: float,
-        leverage: int = 1,
-        trade_direction: str = 'long',
-        strategy_config: Optional[Dict[str, Any]] = None
-    ) -> tuple:
-        """
-        使用旧格式信号进行交易模拟（保持兼容性）
-        """
-        equity_curve = []
-        trades = []
-        total_commission_paid = 0  # Accumulated commission
-        is_liquidated = False  # Liquidation flag
-        liquidation_price = 0  # Liquidation price
-        min_capital_to_trade = 1.0  # Below this balance, consider wiped out
-        
-        capital = initial_capital
-        position = 0  # Positive=long, Negative=short
-        entry_price = 0
-        position_type = None  # 'long' or 'short'
-
-        # Risk controls (also supported for legacy signals): SL / TP / trailing exit
-        cfg = strategy_config or {}
-        exec_cfg = cfg.get('execution') or {}
-        # Signal confirmation / execution timing (legacy mode):
-        # - bar_close: execute on the same bar close
-        # - next_bar_open: execute on next bar open after signal is confirmed on bar close (recommended)
-        signal_timing = str(exec_cfg.get('signalTiming') or 'next_bar_open').strip().lower()
-        risk_cfg = cfg.get('risk') or {}
-        stop_loss_pct = float(risk_cfg.get('stopLossPct') or 0.0)
-        take_profit_pct = float(risk_cfg.get('takeProfitPct') or 0.0)
-        trailing_cfg = risk_cfg.get('trailing') or {}
-        trailing_enabled = bool(trailing_cfg.get('enabled'))
-        trailing_pct = float(trailing_cfg.get('pct') or 0.0)
-        trailing_activation_pct = float(trailing_cfg.get('activationPct') or 0.0)
-        
-        # Risk percentages are defined on margin PnL; convert to price move thresholds by leverage.
-        lev = max(int(leverage or 1), 1)
-        stop_loss_pct_eff = stop_loss_pct / lev
-        take_profit_pct_eff = take_profit_pct / lev
-        trailing_pct_eff = trailing_pct / lev
-        trailing_activation_pct_eff = trailing_activation_pct / lev
-        highest_since_entry = None
-        lowest_since_entry = None
-
-        # --- Position / scaling config (make old-format strategies support the same backtest modal features) ---
-        pos_cfg = cfg.get('position') or {}
-        entry_pct_cfg = float(pos_cfg.get('entryPct') if pos_cfg.get('entryPct') is not None else 1.0)  # expected 0~1
-        # Accept both 0~1 and 0~100 inputs (some clients may send percent units).
-        if entry_pct_cfg > 1:
-            entry_pct_cfg = entry_pct_cfg / 100.0
-        entry_pct_cfg = max(0.0, min(entry_pct_cfg, 1.0))
-
-        scale_cfg = cfg.get('scale') or {}
-        trend_add_cfg = scale_cfg.get('trendAdd') or {}
-        dca_add_cfg = scale_cfg.get('dcaAdd') or {}
-        trend_reduce_cfg = scale_cfg.get('trendReduce') or {}
-        adverse_reduce_cfg = scale_cfg.get('adverseReduce') or {}
-
-        trend_add_enabled = bool(trend_add_cfg.get('enabled'))
-        trend_add_step_pct = float(trend_add_cfg.get('stepPct') or 0.0)
-        trend_add_size_pct = float(trend_add_cfg.get('sizePct') or 0.0)
-        trend_add_max_times = int(trend_add_cfg.get('maxTimes') or 0)
-
-        dca_add_enabled = bool(dca_add_cfg.get('enabled'))
-        dca_add_step_pct = float(dca_add_cfg.get('stepPct') or 0.0)
-        dca_add_size_pct = float(dca_add_cfg.get('sizePct') or 0.0)
-        dca_add_max_times = int(dca_add_cfg.get('maxTimes') or 0)
-
-        trend_reduce_enabled = bool(trend_reduce_cfg.get('enabled'))
-        trend_reduce_step_pct = float(trend_reduce_cfg.get('stepPct') or 0.0)
-        trend_reduce_size_pct = float(trend_reduce_cfg.get('sizePct') or 0.0)
-        trend_reduce_max_times = int(trend_reduce_cfg.get('maxTimes') or 0)
-
-        adverse_reduce_enabled = bool(adverse_reduce_cfg.get('enabled'))
-        adverse_reduce_step_pct = float(adverse_reduce_cfg.get('stepPct') or 0.0)
-        adverse_reduce_size_pct = float(adverse_reduce_cfg.get('sizePct') or 0.0)
-        adverse_reduce_max_times = int(adverse_reduce_cfg.get('maxTimes') or 0)
-
-        # Trigger pct to price threshold with leverage
-        trend_add_step_pct_eff = trend_add_step_pct / lev
-        dca_add_step_pct_eff = dca_add_step_pct / lev
-        trend_reduce_step_pct_eff = trend_reduce_step_pct / lev
-        adverse_reduce_step_pct_eff = adverse_reduce_step_pct / lev
-
-        # State for scaling
-        trend_add_times = 0
-        dca_add_times = 0
-        trend_reduce_times = 0
-        adverse_reduce_times = 0
-        last_trend_add_anchor = None
-        last_dca_add_anchor = None
-        last_trend_reduce_anchor = None
-        last_adverse_reduce_anchor = None
-        
-        # Apply execution timing to avoid look-ahead bias in legacy signals (buy/sell series):
-        # If signal is computed on bar close, realistic execution is next bar open.
-        signals_exec = signals
-        if signal_timing in ['next_bar_open', 'next_open', 'nextopen', 'next']:
-            try:
-                signals_exec = signals.shift(1).fillna(0)
-            except Exception:
-                signals_exec = signals
-
-        for i, (timestamp, row) in enumerate(df.iterrows()):
-            # 爆仓后直接停止回测，输出结果
-            if is_liquidated:
-                break
-
-            # If no position and balance low, stop trading
-            if position == 0 and capital < min_capital_to_trade:
-                is_liquidated = True
-                liquidation_loss = self._liquidation_loss(capital)
-                capital = 0
-                trades.append({
-                    'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                    'type': 'liquidation',
-                    'price': round(float(row.get('close', 0) or 0), 4),
-                    'amount': 0,
-                    'profit': liquidation_loss,
-                    'balance': 0
-                })
-                equity_curve.append({'time': timestamp.strftime('%Y-%m-%d %H:%M'), 'value': 0})
-                continue
-            
-            signal = signals_exec.iloc[i] if i < len(signals_exec) else 0
-            high = row['high']
-            low = row['low']
-            price = row['close']
-            open_ = row.get('open', price)
-
-            # Forced exit (TP/SL/trailing) over signals
-            if position != 0 and position_type in ['long', 'short']:
-                if position_type == 'long' and position > 0:
-                    if highest_since_entry is None:
-                        highest_since_entry = entry_price
-                    highest_since_entry = max(highest_since_entry, high)
-                    candidates = []
-                    if stop_loss_pct_eff > 0:
-                        sl_price = entry_price * (1 - stop_loss_pct_eff)
-                        if low <= sl_price:
-                            candidates.append(('stop', sl_price))
-                    if take_profit_pct_eff > 0:
-                        tp_price = entry_price * (1 + take_profit_pct_eff)
-                        if high >= tp_price:
-                            candidates.append(('profit', tp_price))
-                    if trailing_enabled and trailing_pct_eff > 0:
-                        trail_active = True
-                        if trailing_activation_pct_eff > 0:
-                            trail_active = highest_since_entry >= entry_price * (1 + trailing_activation_pct_eff)
-                        if trail_active:
-                            tr_price = highest_since_entry * (1 - trailing_pct_eff)
-                            if low <= tr_price:
-                                candidates.append(('trailing', tr_price))
-                    if candidates:
-                        # SL > TrailingStop > TP
-                        pri = {'stop': 0, 'trailing': 1, 'profit': 2}
-                        reason, trigger_price = sorted(candidates, key=lambda x: (pri.get(x[0], 99), x[1]))[0]
-                        exec_price = trigger_price * (1 - slippage)
-                        commission_fee = position * exec_price * commission
-                        # Entry commission deducted, only deduct exit commission
-                        profit = (exec_price - entry_price) * position - commission_fee
-                        capital += profit
-                        total_commission_paid += commission_fee
-                        trades.append({
-                            'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                            'type': {'stop': 'close_long_stop', 'profit': 'close_long_profit', 'trailing': 'close_long_trailing'}.get(reason, 'close_long'),
-                            'price': round(exec_price, 4),
-                            'amount': round(position, 4),
-                            'profit': round(profit, 2),
-                            'balance': round(max(0, capital), 2)
-                        })
-                        position = 0
-                        position_type = None
-                        liquidation_price = 0
-                        highest_since_entry = None
-                        lowest_since_entry = None
-                        equity_curve.append({'time': timestamp.strftime('%Y-%m-%d %H:%M'), 'value': round(capital, 2)})
-                        continue
-
-                if position_type == 'short' and position < 0:
-                    shares = abs(position)
-                    if lowest_since_entry is None:
-                        lowest_since_entry = entry_price
-                    lowest_since_entry = min(lowest_since_entry, low)
-                    candidates = []
-                    if stop_loss_pct_eff > 0:
-                        sl_price = entry_price * (1 + stop_loss_pct_eff)
-                        if high >= sl_price:
-                            candidates.append(('stop', sl_price))
-                    if take_profit_pct_eff > 0:
-                        tp_price = entry_price * (1 - take_profit_pct_eff)
-                        if low <= tp_price:
-                            candidates.append(('profit', tp_price))
-                    if trailing_enabled and trailing_pct_eff > 0:
-                        trail_active = True
-                        if trailing_activation_pct_eff > 0:
-                            trail_active = lowest_since_entry <= entry_price * (1 - trailing_activation_pct_eff)
-                        if trail_active:
-                            tr_price = lowest_since_entry * (1 + trailing_pct_eff)
-                            if high >= tr_price:
-                                candidates.append(('trailing', tr_price))
-                    if candidates:
-                        # SL > TrailingStop > TP
-                        pri = {'stop': 0, 'trailing': 1, 'profit': 2}
-                        reason, trigger_price = sorted(candidates, key=lambda x: (pri.get(x[0], 99), -x[1]))[0]
-                        exec_price = trigger_price * (1 + slippage)
-                        commission_fee = shares * exec_price * commission
-                        # Entry commission deducted, only deduct exit commission
-                        profit = (entry_price - exec_price) * shares - commission_fee
-                        if capital + profit <= 0:
-                            liquidation_loss = self._liquidation_loss(capital)
-                            capital = 0
-                            is_liquidated = True
-                            trades.append({
-                                'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                                'type': 'liquidation',
-                                'price': round(exec_price, 4),
-                                'amount': round(shares, 4),
-                                'profit': liquidation_loss,
-                                'balance': 0
-                            })
-                            position = 0
-                            position_type = None
-                            liquidation_price = 0
-                            equity_curve.append({'time': timestamp.strftime('%Y-%m-%d %H:%M'), 'value': 0})
-                            continue
-                        capital += profit
-                        total_commission_paid += commission_fee
-                        trades.append({
-                            'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                            'type': {'stop': 'close_short_stop', 'profit': 'close_short_profit', 'trailing': 'close_short_trailing'}.get(reason, 'close_short'),
-                            'price': round(exec_price, 4),
-                            'amount': round(shares, 4),
-                            'profit': round(profit, 2),
-                            'balance': round(max(0, capital), 2)
-                        })
-                        position = 0
-                        position_type = None
-                        liquidation_price = 0
-                        highest_since_entry = None
-                        lowest_since_entry = None
-                        equity_curve.append({'time': timestamp.strftime('%Y-%m-%d %H:%M'), 'value': round(capital, 2)})
-                        continue
-            
-            # --- Parameterized scaling rules (also for old-format strategies) ---
-            # Note: old format only has buy/sell, but scaling params should work.
-            # Trigger pct as post-leverage threshold.
-            # IMPORTANT: if this candle has a main buy/sell signal, do NOT apply any scale-in/scale-out.
-            if signal == 0 and position != 0 and position_type in ['long', 'short'] and capital >= min_capital_to_trade:
-                # Long
-                if position_type == 'long' and position > 0:
-                    # Trend add（顺势加仓：上涨触发）
-                    if trend_add_enabled and trend_add_step_pct_eff > 0 and trend_add_size_pct > 0 and (trend_add_max_times == 0 or trend_add_times < trend_add_max_times):
-                        anchor = last_trend_add_anchor if last_trend_add_anchor is not None else entry_price
-                        trigger = anchor * (1 + trend_add_step_pct_eff)
-                        if high >= trigger:
-                            order_pct = trend_add_size_pct
-                            if order_pct > 0:
-                                exec_price_add = trigger * (1 + slippage)
-                                use_capital = capital * order_pct
-                                shares_add = (use_capital * leverage) / exec_price_add
-                                commission_fee = shares_add * exec_price_add * commission
-
-                                total_cost_before = position * entry_price
-                                total_cost_after = total_cost_before + shares_add * exec_price_add
-                                position += shares_add
-                                entry_price = total_cost_after / position
-
-                                capital -= commission_fee
-                                total_commission_paid += commission_fee
-                                liquidation_price = entry_price * (1 - 1.0 / leverage)
-
-                                trend_add_times += 1
-                                last_trend_add_anchor = trigger
-
-                                trades.append({
-                                    'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                                    'type': 'add_long',
-                                    'price': round(exec_price_add, 4),
-                                    'amount': round(shares_add, 4),
-                                    'profit': 0,
-                                    'balance': round(max(0, capital), 2)
-                                })
-
-                    # DCA add（逆势加仓：下跌触发）
-                    if dca_add_enabled and dca_add_step_pct_eff > 0 and dca_add_size_pct > 0 and (dca_add_max_times == 0 or dca_add_times < dca_add_max_times):
-                        anchor = last_dca_add_anchor if last_dca_add_anchor is not None else entry_price
-                        trigger = anchor * (1 - dca_add_step_pct_eff)
-                        if low <= trigger:
-                            order_pct = dca_add_size_pct
-                            if order_pct > 0:
-                                exec_price_add = trigger * (1 + slippage)
-                                use_capital = capital * order_pct
-                                shares_add = (use_capital * leverage) / exec_price_add
-                                commission_fee = shares_add * exec_price_add * commission
-
-                                total_cost_before = position * entry_price
-                                total_cost_after = total_cost_before + shares_add * exec_price_add
-                                position += shares_add
-                                entry_price = total_cost_after / position
-
-                                capital -= commission_fee
-                                total_commission_paid += commission_fee
-                                liquidation_price = entry_price * (1 - 1.0 / leverage)
-
-                                dca_add_times += 1
-                                last_dca_add_anchor = trigger
-
-                                trades.append({
-                                    'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                                    'type': 'add_long',
-                                    'price': round(exec_price_add, 4),
-                                    'amount': round(shares_add, 4),
-                                    'profit': 0,
-                                    'balance': round(max(0, capital), 2)
-                                })
-
-                    # Trend reduce（顺势减仓：上涨触发）
-                    if trend_reduce_enabled and trend_reduce_step_pct_eff > 0 and trend_reduce_size_pct > 0 and (trend_reduce_max_times == 0 or trend_reduce_times < trend_reduce_max_times):
-                        anchor = last_trend_reduce_anchor if last_trend_reduce_anchor is not None else entry_price
-                        trigger = anchor * (1 + trend_reduce_step_pct_eff)
-                        if high >= trigger:
-                            reduce_pct = max(trend_reduce_size_pct, 0.0)
-                            reduce_shares = position * reduce_pct
-                            if reduce_shares > 0:
-                                exec_price_reduce = trigger * (1 - slippage)
-                                commission_fee = reduce_shares * exec_price_reduce * commission
-                                profit = (exec_price_reduce - entry_price) * reduce_shares - commission_fee
-                                capital += profit
-                                total_commission_paid += commission_fee
-                                position -= reduce_shares
-                                if position <= 1e-12:
-                                    position = 0
-                                    position_type = None
-                                    liquidation_price = 0
-                                    last_trend_add_anchor = last_dca_add_anchor = last_trend_reduce_anchor = last_adverse_reduce_anchor = None
-                                    trend_add_times = dca_add_times = trend_reduce_times = adverse_reduce_times = 0
-                                else:
-                                    liquidation_price = entry_price * (1 - 1.0 / leverage)
-
-                                trend_reduce_times += 1
-                                last_trend_reduce_anchor = trigger
-
-                                trades.append({
-                                    'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                                    'type': 'reduce_long',
-                                    'price': round(exec_price_reduce, 4),
-                                    'amount': round(reduce_shares, 4),
-                                    'profit': round(profit, 2),
-                                    'balance': round(max(0, capital), 2)
-                                })
-
-                    # Adverse reduce（逆势减仓：下跌触发）
-                    if position_type == 'long' and position > 0 and adverse_reduce_enabled and adverse_reduce_step_pct_eff > 0 and adverse_reduce_size_pct > 0 and (adverse_reduce_max_times == 0 or adverse_reduce_times < adverse_reduce_max_times):
-                        anchor = last_adverse_reduce_anchor if last_adverse_reduce_anchor is not None else entry_price
-                        trigger = anchor * (1 - adverse_reduce_step_pct_eff)
-                        if low <= trigger:
-                            reduce_pct = max(adverse_reduce_size_pct, 0.0)
-                            reduce_shares = position * reduce_pct
-                            if reduce_shares > 0:
-                                exec_price_reduce = trigger * (1 - slippage)
-                                commission_fee = reduce_shares * exec_price_reduce * commission
-                                profit = (exec_price_reduce - entry_price) * reduce_shares - commission_fee
-                                capital += profit
-                                total_commission_paid += commission_fee
-                                position -= reduce_shares
-                                if position <= 1e-12:
-                                    position = 0
-                                    position_type = None
-                                    liquidation_price = 0
-                                    last_trend_add_anchor = last_dca_add_anchor = last_trend_reduce_anchor = last_adverse_reduce_anchor = None
-                                    trend_add_times = dca_add_times = trend_reduce_times = adverse_reduce_times = 0
-                                else:
-                                    liquidation_price = entry_price * (1 - 1.0 / leverage)
-
-                                adverse_reduce_times += 1
-                                last_adverse_reduce_anchor = trigger
-
-                                trades.append({
-                                    'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                                    'type': 'reduce_long',
-                                    'price': round(exec_price_reduce, 4),
-                                    'amount': round(reduce_shares, 4),
-                                    'profit': round(profit, 2),
-                                    'balance': round(max(0, capital), 2)
-                                })
-
-                # Short
-                if position_type == 'short' and position < 0:
-                    shares_total = abs(position)
-
-                    # Trend add（顺势加空：下跌触发）
-                    if trend_add_enabled and trend_add_step_pct_eff > 0 and trend_add_size_pct > 0 and (trend_add_max_times == 0 or trend_add_times < trend_add_max_times):
-                        anchor = last_trend_add_anchor if last_trend_add_anchor is not None else entry_price
-                        trigger = anchor * (1 - trend_add_step_pct_eff)
-                        if low <= trigger:
-                            order_pct = trend_add_size_pct
-                            if order_pct > 0:
-                                exec_price_add = trigger * (1 - slippage)
-                                use_capital = capital * order_pct
-                                shares_add = (use_capital * leverage) / exec_price_add
-                                commission_fee = shares_add * exec_price_add * commission
-
-                                total_cost_before = shares_total * entry_price
-                                total_cost_after = total_cost_before + shares_add * exec_price_add
-                                position -= shares_add
-                                shares_total = abs(position)
-                                entry_price = total_cost_after / shares_total
-
-                                capital -= commission_fee
-                                total_commission_paid += commission_fee
-                                liquidation_price = entry_price * (1 + 1.0 / leverage)
-
-                                trend_add_times += 1
-                                last_trend_add_anchor = trigger
-
-                                trades.append({
-                                    'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                                    'type': 'add_short',
-                                    'price': round(exec_price_add, 4),
-                                    'amount': round(shares_add, 4),
-                                    'profit': 0,
-                                    'balance': round(max(0, capital), 2)
-                                })
-
-                    # DCA add（逆势加空：上涨触发）
-                    if dca_add_enabled and dca_add_step_pct_eff > 0 and dca_add_size_pct > 0 and (dca_add_max_times == 0 or dca_add_times < dca_add_max_times):
-                        anchor = last_dca_add_anchor if last_dca_add_anchor is not None else entry_price
-                        trigger = anchor * (1 + dca_add_step_pct_eff)
-                        if high >= trigger:
-                            order_pct = dca_add_size_pct
-                            if order_pct > 0:
-                                exec_price_add = trigger * (1 - slippage)
-                                use_capital = capital * order_pct
-                                shares_add = (use_capital * leverage) / exec_price_add
-                                commission_fee = shares_add * exec_price_add * commission
-
-                                total_cost_before = shares_total * entry_price
-                                total_cost_after = total_cost_before + shares_add * exec_price_add
-                                position -= shares_add
-                                shares_total = abs(position)
-                                entry_price = total_cost_after / shares_total
-
-                                capital -= commission_fee
-                                total_commission_paid += commission_fee
-                                liquidation_price = entry_price * (1 + 1.0 / leverage)
-
-                                dca_add_times += 1
-                                last_dca_add_anchor = trigger
-
-                                trades.append({
-                                    'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                                    'type': 'add_short',
-                                    'price': round(exec_price_add, 4),
-                                    'amount': round(shares_add, 4),
-                                    'profit': 0,
-                                    'balance': round(max(0, capital), 2)
-                                })
-
-                    # Trend reduce（顺势减空：下跌触发，回补一部分）
-                    if trend_reduce_enabled and trend_reduce_step_pct_eff > 0 and trend_reduce_size_pct > 0 and (trend_reduce_max_times == 0 or trend_reduce_times < trend_reduce_max_times):
-                        anchor = last_trend_reduce_anchor if last_trend_reduce_anchor is not None else entry_price
-                        trigger = anchor * (1 - trend_reduce_step_pct_eff)
-                        if low <= trigger:
-                            reduce_pct = max(trend_reduce_size_pct, 0.0)
-                            reduce_shares = shares_total * reduce_pct
-                            if reduce_shares > 0:
-                                exec_price_reduce = trigger * (1 + slippage)
-                                commission_fee = reduce_shares * exec_price_reduce * commission
-                                profit = (entry_price - exec_price_reduce) * reduce_shares - commission_fee
-                                capital += profit
-                                total_commission_paid += commission_fee
-                                position += reduce_shares
-                                shares_total = abs(position)
-                                if shares_total <= 1e-12:
-                                    position = 0
-                                    position_type = None
-                                    liquidation_price = 0
-                                    last_trend_add_anchor = last_dca_add_anchor = last_trend_reduce_anchor = last_adverse_reduce_anchor = None
-                                    trend_add_times = dca_add_times = trend_reduce_times = adverse_reduce_times = 0
-                                else:
-                                    liquidation_price = entry_price * (1 + 1.0 / leverage)
-
-                                trend_reduce_times += 1
-                                last_trend_reduce_anchor = trigger
-
-                                trades.append({
-                                    'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                                    'type': 'reduce_short',
-                                    'price': round(exec_price_reduce, 4),
-                                    'amount': round(reduce_shares, 4),
-                                    'profit': round(profit, 2),
-                                    'balance': round(max(0, capital), 2)
-                                })
-
-                    # Adverse reduce（逆势减空：上涨触发）
-                    if position_type == 'short' and position < 0 and adverse_reduce_enabled and adverse_reduce_step_pct_eff > 0 and adverse_reduce_size_pct > 0 and (adverse_reduce_max_times == 0 or adverse_reduce_times < adverse_reduce_max_times):
-                        anchor = last_adverse_reduce_anchor if last_adverse_reduce_anchor is not None else entry_price
-                        trigger = anchor * (1 + adverse_reduce_step_pct_eff)
-                        if high >= trigger:
-                            reduce_pct = max(adverse_reduce_size_pct, 0.0)
-                            reduce_shares = shares_total * reduce_pct
-                            if reduce_shares > 0:
-                                exec_price_reduce = trigger * (1 + slippage)
-                                commission_fee = reduce_shares * exec_price_reduce * commission
-                                profit = (entry_price - exec_price_reduce) * reduce_shares - commission_fee
-                                capital += profit
-                                total_commission_paid += commission_fee
-                                position += reduce_shares
-                                shares_total = abs(position)
-                                if shares_total <= 1e-12:
-                                    position = 0
-                                    position_type = None
-                                    liquidation_price = 0
-                                    last_trend_add_anchor = last_dca_add_anchor = last_trend_reduce_anchor = last_adverse_reduce_anchor = None
-                                    trend_add_times = dca_add_times = trend_reduce_times = adverse_reduce_times = 0
-                                else:
-                                    liquidation_price = entry_price * (1 + 1.0 / leverage)
-
-                                adverse_reduce_times += 1
-                                last_adverse_reduce_anchor = trigger
-
-                                trades.append({
-                                    'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                                    'type': 'reduce_short',
-                                    'price': round(exec_price_reduce, 4),
-                                    'amount': round(reduce_shares, 4),
-                                    'profit': round(profit, 2),
-                                    'balance': round(max(0, capital), 2)
-                                })
-
-            # Handle different trade directions
-            if trade_direction == 'long':
-                # Long only mode
-                if signal == 1 and position == 0 and capital >= min_capital_to_trade:  # Buy to open long
-                    logger.debug(f"[Long mode] Buy to open long: time={timestamp}, price={price}, leverage={leverage}x")
-                    base_price = open_ if signal_timing in ['next_bar_open', 'next_open', 'nextopen', 'next'] else price
-                    exec_price = base_price * (1 + slippage)
-                    # With leverage: position = capital * leverage / price
-                    # Use specified pct (entryPct preferred; else full)
-                    position_pct = None
-                    if entry_pct_cfg is not None and entry_pct_cfg > 0:
-                        position_pct = entry_pct_cfg
-                    if position_pct is not None and 0 < position_pct < 1:
-                        use_capital = capital * position_pct
-                        shares = (use_capital * leverage) / exec_price
-                    else:
-                        shares = (capital * leverage) / exec_price
-                    # Margin (commission from capital)
-                    margin = capital
-                    commission_fee = shares * exec_price * commission
-                    
-                    position = shares
-                    entry_price = exec_price
-                    position_type = 'long'
-                    capital -= commission_fee  # Only deduct commission
-                    total_commission_paid += commission_fee
-                    
-                    # Long liquidation when price drops to entry * (1 - 1/leverage)
-                    liquidation_price = entry_price * (1 - 1.0 / leverage)
-                    logger.debug(f"Long liquidation price: {liquidation_price:.2f}")
-
-                    # init scaling anchors
-                    last_trend_add_anchor = entry_price
-                    last_dca_add_anchor = entry_price
-                    last_trend_reduce_anchor = entry_price
-                    last_adverse_reduce_anchor = entry_price
-                    
-                    trades.append({
-                        'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                        'type': 'open_long',
-                        'price': round(exec_price, 4),
-                        'amount': round(shares, 4),
-                        'profit': 0,
-                        'balance': round(max(0, capital), 2)
-                    })
-                
-                elif signal == -1 and position > 0:  # Sell to close long
-                    logger.debug(f"[Long mode] Sell to close long: time={timestamp}, price={price}")
-                    base_price = open_ if signal_timing in ['next_bar_open', 'next_open', 'nextopen', 'next'] else price
-                    exec_price = base_price * (1 - slippage)
-                    # PnL = (exit - entry) * shares - commission
-                    commission_fee = position * exec_price * commission
-                    profit = (exec_price - entry_price) * position - commission_fee
-                    capital += profit
-                    total_commission_paid += commission_fee
-                    liquidation_price = 0  # Clear liquidation price
-                    
-                    trades.append({
-                        'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                        'type': 'close_long',
-                        'price': round(exec_price, 4),
-                        'amount': round(position, 4),
-                        'profit': round(profit, 2),
-                        'balance': round(max(0, capital), 2)
-                    })
-                    
-                    position = 0
-                    position_type = None
-                    last_trend_add_anchor = last_dca_add_anchor = last_trend_reduce_anchor = last_adverse_reduce_anchor = None
-                    trend_add_times = dca_add_times = trend_reduce_times = adverse_reduce_times = 0
-                    if capital < min_capital_to_trade:
-                        is_liquidated = True
-                        liquidation_loss = self._liquidation_loss(capital)
-                        capital = 0
-                        trades.append({
-                            'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                            'type': 'liquidation',
-                            'price': round(exec_price, 4),
-                            'amount': 0,
-                            'profit': liquidation_loss,
-                            'balance': 0
-                        })
-            
-            elif trade_direction == 'short':
-                # Short only mode
-                if signal == -1 and position == 0 and capital >= min_capital_to_trade:  # Sell to open short
-                    logger.debug(f"[Short mode] Sell to open short: time={timestamp}, price={price}, leverage={leverage}x")
-                    base_price = open_ if signal_timing in ['next_bar_open', 'next_open', 'nextopen', 'next'] else price
-                    exec_price = base_price * (1 - slippage)
-                    # With leverage: position = capital * leverage / price
-                    position_pct = None
-                    if entry_pct_cfg is not None and entry_pct_cfg > 0:
-                        position_pct = entry_pct_cfg
-                    if position_pct is not None and 0 < position_pct < 1:
-                        use_capital = capital * position_pct
-                        shares = (use_capital * leverage) / exec_price
-                    else:
-                        shares = (capital * leverage) / exec_price
-                    commission_fee = shares * exec_price * commission
-                    
-                    position = -shares  # Negative = short (owe shares)
-                    entry_price = exec_price
-                    position_type = 'short'
-                    capital -= commission_fee  # Only deduct commission
-                    total_commission_paid += commission_fee
-                    
-                    # Short liquidation when price rises to entry * (1 + 1/leverage)
-                    liquidation_price = entry_price * (1 + 1.0 / leverage)
-                    logger.debug(f"Short liquidation price: {liquidation_price:.2f}")
-
-                    last_trend_add_anchor = entry_price
-                    last_dca_add_anchor = entry_price
-                    last_trend_reduce_anchor = entry_price
-                    last_adverse_reduce_anchor = entry_price
-                    
-                    trades.append({
-                        'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                        'type': 'open_short',
-                        'price': round(exec_price, 4),
-                        'amount': round(shares, 4),
-                        'profit': 0,
-                        'balance': round(max(0, capital), 2)
-                    })
-                
-                elif signal == 1 and position < 0:  # Buy to close short
-                    logger.debug(f"[Short mode] Buy to close short: time={timestamp}, price={price}")
-                    base_price = open_ if signal_timing in ['next_bar_open', 'next_open', 'nextopen', 'next'] else price
-                    exec_price = base_price * (1 + slippage)
-                    shares = abs(position)  # Shares to buy back
-                    # PnL = (entry - exit) * shares - commission
-                    commission_fee = shares * exec_price * commission
-                    profit = (entry_price - exec_price) * shares - commission_fee
-                    
-                    # Check for liquidation
-                    if capital + profit <= 0:
-                        logger.warning(f"Insufficient funds when closing short - liquidation: capital={capital:.2f}, loss={-profit:.2f}")
-                        liquidation_loss = self._liquidation_loss(capital)
-                        capital = 0
-                        is_liquidated = True
-                        trades.append({
-                            'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                            'type': 'liquidation',
-                            'price': round(exec_price, 4),
-                            'amount': round(shares, 4),
-                            'profit': liquidation_loss,
-                            'balance': 0
-                        })
-                    else:
-                        capital += profit
-                        total_commission_paid += commission_fee
-                        
-                        trades.append({
-                            'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                            'type': 'close_short',
-                            'price': round(exec_price, 4),
-                            'amount': round(shares, 4),
-                            'profit': round(profit, 2),
-                            'balance': round(max(0, capital), 2)
-                        })
-                    
-                    position = 0
-                    position_type = None
-                    liquidation_price = 0  # Clear liquidation price
-                    last_trend_add_anchor = last_dca_add_anchor = last_trend_reduce_anchor = last_adverse_reduce_anchor = None
-                    trend_add_times = dca_add_times = trend_reduce_times = adverse_reduce_times = 0
-                    if capital < min_capital_to_trade and not is_liquidated:
-                        is_liquidated = True
-                        liquidation_loss = self._liquidation_loss(capital)
-                        capital = 0
-                        trades.append({
-                            'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                            'type': 'liquidation',
-                            'price': round(exec_price, 4),
-                            'amount': 0,
-                            'profit': liquidation_loss,
-                            'balance': 0
-                        })
-            
-            elif trade_direction == 'both':
-                # Both directions mode
-                if signal == 1 and position == 0 and capital >= min_capital_to_trade:  # Buy to open long
-                    logger.debug(f"[Both mode] Buy to open long: time={timestamp}, price={price}, leverage={leverage}x")
-                    base_price = open_ if signal_timing in ['next_bar_open', 'next_open', 'nextopen', 'next'] else price
-                    exec_price = base_price * (1 + slippage)
-                    # With leverage: position = capital * leverage / price
-                    position_pct = None
-                    if entry_pct_cfg is not None and entry_pct_cfg > 0:
-                        position_pct = entry_pct_cfg
-                    if position_pct is not None and 0 < position_pct < 1:
-                        use_capital = capital * position_pct
-                        shares = (use_capital * leverage) / exec_price
-                    else:
-                        shares = (capital * leverage) / exec_price
-                    commission_fee = shares * exec_price * commission
-                    
-                    position = shares
-                    entry_price = exec_price
-                    position_type = 'long'
-                    capital -= commission_fee  # Only deduct commission
-                    total_commission_paid += commission_fee
-                    
-                    # Calculate liquidation price
-                    liquidation_price = entry_price * (1 - 1.0 / leverage)
-                    logger.debug(f"Long liquidation price: {liquidation_price:.2f}")
-
-                    last_trend_add_anchor = entry_price
-                    last_dca_add_anchor = entry_price
-                    last_trend_reduce_anchor = entry_price
-                    last_adverse_reduce_anchor = entry_price
-                    
-                    trades.append({
-                        'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                        'type': 'open_long',
-                        'price': round(exec_price, 4),
-                        'amount': round(shares, 4),
-                        'profit': 0,
-                        'balance': round(max(0, capital), 2)
-                    })
-                
-                elif signal == -1 and position == 0 and capital >= min_capital_to_trade:  # Sell to open short
-                    logger.debug(f"[Both mode] Sell to open short: time={timestamp}, price={price}, leverage={leverage}x")
-                    base_price = open_ if signal_timing in ['next_bar_open', 'next_open', 'nextopen', 'next'] else price
-                    exec_price = base_price * (1 - slippage)
-                    # With leverage: position = capital * leverage / price
-                    position_pct = None
-                    if entry_pct_cfg is not None and entry_pct_cfg > 0:
-                        position_pct = entry_pct_cfg
-                    if position_pct is not None and 0 < position_pct < 1:
-                        use_capital = capital * position_pct
-                        shares = (use_capital * leverage) / exec_price
-                    else:
-                        shares = (capital * leverage) / exec_price
-                    commission_fee = shares * exec_price * commission
-                    
-                    position = -shares
-                    entry_price = exec_price
-                    position_type = 'short'
-                    capital -= commission_fee
-                    total_commission_paid += commission_fee
-                    
-                    # Calculate liquidation price
-                    liquidation_price = entry_price * (1 + 1.0 / leverage)
-                    logger.debug(f"Short liquidation price: {liquidation_price:.2f}")
-
-                    last_trend_add_anchor = entry_price
-                    last_dca_add_anchor = entry_price
-                    last_trend_reduce_anchor = entry_price
-                    last_adverse_reduce_anchor = entry_price
-
-                    trades.append({
-                        'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                        'type': 'open_short',
-                        'price': round(exec_price, 4),
-                        'amount': round(shares, 4),
-                        'profit': 0,
-                        'balance': round(max(0, capital), 2)
-                    })
-                
-                elif signal == -1 and position > 0:  # Close long open short
-                    logger.debug(f"[Both mode] Close long open short: time={timestamp}, price={price}")
-                    # First close long
-                    base_price = open_ if signal_timing in ['next_bar_open', 'next_open', 'nextopen', 'next'] else price
-                    exec_price = base_price * (1 - slippage)
-                    commission_fee_close = position * exec_price * commission
-                    profit = (exec_price - entry_price) * position - commission_fee_close
-                    capital += profit
-                    total_commission_paid += commission_fee_close
-                    
-                    trades.append({
-                        'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                        'type': 'close_long',
-                        'price': round(exec_price, 4),
-                        'amount': round(position, 4),
-                        'profit': round(profit, 2),
-                        'balance': round(max(0, capital), 2)
-                    })
-                    
-                    # Stop if balance too low after exit
-                    if capital < min_capital_to_trade or is_liquidated:
-                        is_liquidated = True
-                        liquidation_loss = self._liquidation_loss(capital)
-                        capital = 0
-                        trades.append({
-                            'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                            'type': 'liquidation',
-                            'price': round(exec_price, 4),
-                            'amount': 0,
-                            'profit': liquidation_loss,
-                            'balance': 0
-                        })
-                        continue
-
-                    # Re-open short (respects entryPct; default entryPct=100%)
-                    position_pct = None
-                    if entry_pct_cfg is not None and entry_pct_cfg > 0:
-                        position_pct = entry_pct_cfg
-                    if position_pct is not None and 0 < position_pct < 1:
-                        use_capital = capital * position_pct
-                        shares = (use_capital * leverage) / exec_price
-                    else:
-                        shares = (capital * leverage) / exec_price
-                    commission_fee_open = shares * exec_price * commission
-                    
-                    position = -shares
-                    entry_price = exec_price
-                    position_type = 'short'
-                    capital -= commission_fee_open
-                    total_commission_paid += commission_fee_open
-                    
-                    # Calculate liquidation price
-                    liquidation_price = entry_price * (1 + 1.0 / leverage)
-                    logger.debug(f"Short liquidation price: {liquidation_price:.2f}")
-                    
-                    trades.append({
-                        'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                        'type': 'open_short',
-                        'price': round(exec_price, 4),
-                        'amount': round(shares, 4),
-                        'profit': 0,
-                        'balance': round(max(0, capital), 2)
-                    })
-                
-                elif signal == 1 and position < 0:  # Close short open long
-                    logger.debug(f"[Both mode] Close short open long: time={timestamp}, price={price}")
-                    # First close short
-                    base_price = open_ if signal_timing in ['next_bar_open', 'next_open', 'nextopen', 'next'] else price
-                    exec_price = base_price * (1 + slippage)
-                    shares = abs(position)
-                    commission_fee_close = shares * exec_price * commission
-                    profit = (entry_price - exec_price) * shares - commission_fee_close
-                    
-                    # Check for liquidation
-                    if capital + profit <= 0:
-                        logger.warning(f"Insufficient funds when closing short - liquidation: capital={capital:.2f}, loss={-profit:.2f}")
-                        liquidation_loss = self._liquidation_loss(capital)
-                        capital = 0
-                        is_liquidated = True
-                        trades.append({
-                            'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                            'type': 'liquidation',
-                            'price': round(exec_price, 4),
-                            'amount': round(shares, 4),
-                            'profit': liquidation_loss,
-                            'balance': 0
-                        })
-                        position = 0
-                        position_type = None
-                        continue  # No new positions after liquidation
-                    
-                    capital += profit
-                    total_commission_paid += commission_fee_close
-                    
-                    trades.append({
-                        'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                        'type': 'close_short',
-                        'price': round(exec_price, 4),
-                        'amount': round(shares, 4),
-                        'profit': round(profit, 2),
-                        'balance': round(max(0, capital), 2)
-                    })
-                    
-                    if capital < min_capital_to_trade or is_liquidated:
-                        is_liquidated = True
-                        liquidation_loss = self._liquidation_loss(capital)
-                        capital = 0
-                        trades.append({
-                            'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                            'type': 'liquidation',
-                            'price': round(exec_price, 4),
-                            'amount': 0,
-                            'profit': liquidation_loss,
-                            'balance': 0
-                        })
-                        continue
-
-                    # Re-open long (respects entryPct; default entryPct=100%)
-                    position_pct = None
-                    if entry_pct_cfg is not None and entry_pct_cfg > 0:
-                        position_pct = entry_pct_cfg
-                    if position_pct is not None and 0 < position_pct < 1:
-                        use_capital = capital * position_pct
-                        shares = (use_capital * leverage) / exec_price
-                    else:
-                        shares = (capital * leverage) / exec_price
-                    commission_fee_open = shares * exec_price * commission
-                    
-                    position = shares
-                    entry_price = exec_price
-                    position_type = 'long'
-                    capital -= commission_fee_open
-                    total_commission_paid += commission_fee_open
-                    
-                    # Calculate liquidation price
-                    liquidation_price = entry_price * (1 - 1.0 / leverage)
-                    logger.debug(f"Long liquidation price: {liquidation_price:.2f}")
-                    
-                    trades.append({
-                        'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                        'type': 'open_long',
-                        'price': round(exec_price, 4),
-                        'amount': round(shares, 4),
-                        'profit': 0,
-                        'balance': round(max(0, capital), 2)
-                    })
-            
-            # Check if liquidation hit (safety net, only when no active exit)
-            # Note: check after all signals, SL/TP takes priority
-            if position != 0 and not is_liquidated:
-                if position_type == 'long':
-                    # Long爆仓：价格跌破爆仓线
-                    if price <= liquidation_price:
-                        logger.warning(f"Long liquidation! entry={entry_price:.2f}, current={price:.2f}, liq_price={liquidation_price:.2f}")
-                        is_liquidated = True
-                        liquidation_loss = self._liquidation_loss(capital)
-                        capital = 0
-                        trades.append({
-                            'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                            'type': 'liquidation',
-                            'price': round(liquidation_price, 4),
-                            'amount': round(abs(position), 4),
-                            'profit': liquidation_loss,
-                            'balance': 0
-                        })
-                        position = 0
-                        position_type = None
-                        equity_curve.append({
-                            'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                            'value': 0
-                        })
-                        continue
-                elif position_type == 'short':
-                    # Short爆仓：价格涨破爆仓线
-                    if price >= liquidation_price:
-                        logger.warning(f"Short liquidation! entry={entry_price:.2f}, current={price:.2f}, liq_price={liquidation_price:.2f}")
-                        is_liquidated = True
-                        liquidation_loss = self._liquidation_loss(capital)
-                        capital = 0
-                        trades.append({
-                            'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                            'type': 'liquidation',
-                            'price': round(liquidation_price, 4),
-                            'amount': round(abs(position), 4),
-                            'profit': liquidation_loss,
-                            'balance': 0
-                        })
-                        position = 0
-                        position_type = None
-                        equity_curve.append({
-                            'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                            'value': 0
-                        })
-                        continue
-            
-            # Record equity
-            if position_type == 'long':
-                # Long equity = cash + unrealized PnL
-                # Unrealized PnL = (current - entry) * shares
-                unrealized_pnl = (price - entry_price) * position
-                total_value = capital + unrealized_pnl
-            elif position_type == 'short':
-                # Short equity = cash + unrealized PnL
-                # Unrealized PnL = (entry - current) * shares
-                shares = abs(position)
-                unrealized_pnl = (entry_price - price) * shares
-                total_value = capital + unrealized_pnl
-            else:
-                total_value = capital
-            
-            # Ensure equity is not negative (liquidation already handled)
-            if total_value < 0:
-                total_value = 0
-            
-            equity_curve.append({
-                'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                'value': round(total_value, 2)
-            })
-        
-        # Force exit at backtest end
-        if position != 0:
-            timestamp = df.index[-1]
-            price = df.iloc[-1]['close']
-            
-            if position > 0:  # Close long
-                exec_price = price * (1 - slippage)
-                commission_fee = position * exec_price * commission
-                profit = (exec_price - entry_price) * position - commission_fee
-                capital += profit
-                total_commission_paid += commission_fee
-                
-                # Record close long trade
-                trades.append({
-                    'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                    'type': 'close_long',
-                    'price': round(exec_price, 4),
-                    'amount': round(position, 4),
-                    'profit': round(profit, 2),
-                    'balance': round(max(0, capital), 2)
-                })
-            else:  # Close short
-                exec_price = price * (1 + slippage)
-                shares = abs(position)
-                commission_fee = shares * exec_price * commission
-                profit = (entry_price - exec_price) * shares - commission_fee
-                
-                # Check for liquidation
-                if capital + profit <= 0:
-                    logger.warning(f"Liquidation at backtest end! Close short loss too large: capital={capital:.2f}, loss={-profit:.2f}")
-                    is_liquidated = True
-                    liquidation_loss = self._liquidation_loss(capital)
-                    trades.append({
-                        'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                        'type': 'liquidation',
-                        'price': round(exec_price, 4),
-                        'amount': round(shares, 4),
-                        'profit': liquidation_loss,
-                        'balance': 0
-                    })
-                    capital = 0
-                else:
-                    capital += profit
-                    total_commission_paid += commission_fee
-                    
-                    # Record close short trade
-                    trades.append({
-                        'time': timestamp.strftime('%Y-%m-%d %H:%M'),
-                        'type': 'close_short',
-                        'price': round(exec_price, 4),
-                        'amount': round(shares, 4),
-                        'profit': round(profit, 2),
-                        'balance': round(max(0, capital), 2)
-                    })
-            
-            # Update last equity curve value with capital after forced exit
-            if equity_curve:
-                equity_curve[-1]['value'] = round(capital, 2)
-        
-        return equity_curve, trades, total_commission_paid
-    
     def _calculate_metrics(
         self,
         equity_curve: List,
@@ -4780,6 +4223,10 @@ import pandas as pd
         mtf_requested: bool = False,
         mtf_active: bool = False,
         mtf_fallback_reason: Optional[str] = None,
+        commission: Optional[float] = None,
+        slippage: Optional[float] = None,
+        backtest_preset: Optional[str] = None,
+        strict_mode_aligned: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """
         Human-facing metadata so the UI can explain how trades were timed vs chart markers.
@@ -4808,7 +4255,72 @@ import pandas as pd
         }
         if mtf_fallback_reason:
             payload['mtfFallbackReason'] = mtf_fallback_reason
+        try:
+            if commission is not None:
+                payload['commission'] = round(float(commission), 6)
+        except (TypeError, ValueError):
+            pass
+        try:
+            if slippage is not None:
+                payload['slippage'] = round(float(slippage), 6)
+        except (TypeError, ValueError):
+            pass
+        if backtest_preset:
+            payload['backtestPreset'] = str(backtest_preset)
+        if strict_mode_aligned is not None:
+            payload['strictModeAligned'] = bool(strict_mode_aligned)
         return payload
+
+    @staticmethod
+    def _annotate_signal_bar_times(
+        trades: List[Dict[str, Any]],
+        signal_tf_seconds: int,
+        signal_timing: str,
+    ) -> None:
+        """Backfill `signal_bar_time` onto every trade for chart double-display.
+
+        Convention for the frontend overlay layer:
+          * `bar_time`        = chart-aligned EXECUTION bar (what user sees as fill)
+          * `signal_bar_time` = chart-aligned SIGNAL bar (where the rule fired)
+
+        For pure signal-triggered open/close (no _stop/_profit/_trailing/liquidation
+        suffix) under `next_bar_open`, signal bar is exactly one signal_tf BEFORE
+        the execution bar. For SL/TP/trailing/liquidation triggers, there is no
+        meaningful "signal bar" — they fire intra-bar from the price path — so we
+        align signal_bar_time to bar_time so the renderer only draws a single marker.
+        For `bar_close` execution mode, signal and execution coincide on the same bar.
+        """
+        if not trades:
+            return
+        delta_seconds = int(signal_tf_seconds) if signal_tf_seconds else 0
+        use_offset = (
+            delta_seconds > 0
+            and str(signal_timing or '').strip().lower()
+            in ('next_bar_open', 'next_open', 'nextopen', 'next')
+        )
+        delta = timedelta(seconds=delta_seconds) if use_offset else timedelta(0)
+        for trade in trades:
+            if 'signal_bar_time' in trade:
+                continue
+            bt = trade.get('bar_time') or trade.get('time')
+            if not bt:
+                trade['signal_bar_time'] = None
+                continue
+            ty = str(trade.get('type') or '').lower()
+            price_path_trigger = (
+                '_stop' in ty
+                or '_profit' in ty
+                or '_trailing' in ty
+                or ty == 'liquidation'
+            )
+            if not use_offset or price_path_trigger:
+                trade['signal_bar_time'] = bt
+                continue
+            try:
+                bt_dt = pd.to_datetime(bt)
+                trade['signal_bar_time'] = (bt_dt - delta).strftime('%Y-%m-%d %H:%M')
+            except Exception:
+                trade['signal_bar_time'] = bt
 
     def _format_result(
         self,
