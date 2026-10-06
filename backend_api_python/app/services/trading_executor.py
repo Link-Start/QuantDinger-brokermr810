@@ -1772,6 +1772,11 @@ class TradingExecutor:
             market_type=str(values.get("market_type") or "spot"),
             execution_mode=str(values.get("execution_mode") or "signal"),
             leverage=leverage,
+            margin_mode=str(
+                trading_config.get("margin_mode")
+                or trading_config.get("marginMode")
+                or "cross"
+            ),
             reason=str(values.get("signal_reason") or ""),
             notification_config=dict(values.get("notification_config") or {}),
             order_type=str(values.get("order_type") or "market"),
